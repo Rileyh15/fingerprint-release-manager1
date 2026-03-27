@@ -605,6 +605,14 @@ def h(text):
     if text is None: return ""
     return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 
+def fmt_dt(val):
+    """Format a datetime or string value for display (YYYY-MM-DD HH:MM)."""
+    if val is None:
+        return ""
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%d %H:%M")
+    return str(val)[:16]
+
 def render_page(title, content, active=""):
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -784,7 +792,7 @@ def _applicant_table(rows, full=False):
         t += f'<td style="font-family:monospace;font-size:12px">{h(a["assigned_code"]) or "—"}</td>'
         if full:
             if a["email_sent"]:
-                t += f'<td style="color:var(--s);font-size:12px"><i class="fas fa-check-circle"></i> {(a["email_sent_at"] or "")[:16]}</td>'
+                t += f'<td style="color:var(--s);font-size:12px"><i class="fas fa-check-circle"></i> {fmt_dt(a["email_sent_at"])}</td>'
             else:
                 t += '<td>—</td>'
         t += '<td><div class="acts">'
@@ -874,7 +882,7 @@ def page_codes(db, params):
             c += f'<tr><td style="font-family:monospace;font-weight:600">{h(r["code"])}</td>'
             c += f'<td><span class="badge {st_cls}">{st_lbl}</span></td>'
             c += f'<td>{h(name)}</td><td>{h(r["batch_name"]) or "—"}</td>'
-            c += f'<td>{(r["imported_at"] or "")[:16] or "—"}</td></tr>'
+            c += f'<td>{fmt_dt(r["imported_at"]) or "—"}</td></tr>'
         c += '</tbody></table>'
     else:
         c += '<div class="es"><i class="fas fa-key"></i><h3>No codes</h3><p>Import from Excel or add manually.</p></div>'
@@ -975,7 +983,7 @@ def page_logs(db):
         for l in elogs:
             nm = f'{l["first_name"]} {l["last_name"]}' if l["first_name"] else "—"
             st = '<span class="badge b-av">Sent</span>' if l["status"]=="sent" else '<span class="badge" style="background:#fef2f2;color:#991b1b">Failed</span>'
-            c += f'<tr><td>{h(nm)}</td><td>{h(l["recipient_email"])}</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{h(l["subject"])}</td><td>{st}</td><td>{(l["sent_at"] or "")[:16]}</td></tr>'
+            c += f'<tr><td>{h(nm)}</td><td>{h(l["recipient_email"])}</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{h(l["subject"])}</td><td>{st}</td><td>{fmt_dt(l["sent_at"])}</td></tr>'
         c += '</tbody></table>'
     else:
         c += '<div class="es"><p>No emails sent yet.</p></div>'
@@ -987,7 +995,7 @@ def page_logs(db):
         for l in xlogs:
             st_cls = "b-av" if l["parsed_status"]=="success" else "b-pe"
             c += f'<tr><td><span class="badge b-pe">{h(l["direction"])}</span></td><td><span class="badge {st_cls}">{h(l["parsed_status"])}</span></td>'
-            c += f'<td>{(l["received_at"] or "")[:16]}</td><td style="font-size:10px;font-family:monospace;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{h((l["raw_xml"] or "")[:80])}</td></tr>'
+            c += f'<td>{fmt_dt(l["received_at"])}</td><td style="font-size:10px;font-family:monospace;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{h((l["raw_xml"] or "")[:80])}</td></tr>'
         c += '</tbody></table>'
     else:
         c += '<div class="es"><p>No XML data received yet.</p></div>'
