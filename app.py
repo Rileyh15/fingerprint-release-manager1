@@ -22,6 +22,7 @@ import cgi
 import io
 import csv
 import shutil
+import base64
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from email.mime.multipart import MIMEMultipart
@@ -974,6 +975,26 @@ class Handler(BaseHTTPRequestHandler):
         try:
             # Accio Data XML push endpoint
             if path == "/api/accio-push":
+                # Validate Basic Auth credentials from Accio
+                ACCIO_USERNAME = os.environ.get("ACCIO_USERNAME", "FPrelease")
+                ACCIO_PASSWORD = os.environ.get("ACCIO_PASSWORD", "fingerprint")
+                auth_header = self.headers.get("Authorization", "")
+                auth_valid = False
+                if auth_header.startswith("Basic "):
+                    try:
+                        decoded = base64.b64decode(auth_header[6:]).decode()
+                        u, p = decoded.split(":", 1)
+                        if u == ACCIO_USERNAME and p == ACCIO_PASSWORD:
+                            auth_valid = True
+                    except Exception:
+                        pass
+                # Also check for credentials in XML or query params as fallback
+                qs = urllib.parse.parse_qs(parsed.query)
+                if not auth_valid and qs.get("username", [None])[0] == ACCIO_USERNAME and qs.get("password", [None])[0] == ACCIO_PASSWORD:
+                    auth_valid = True
+                if not auth_valid:
+                    self._send(401, '<?xml version="1.0" encoding="UTF-8"?>\n<XML><error>Authentication required</error></XML>', "text/xml")
+                    return
                 length = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(length).decode()
                 db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status) VALUES ('inbound',?,'processing')", (raw[:10000],))
