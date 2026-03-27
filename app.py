@@ -1,3 +1,4 @@
+
 """
 Fingerprint Release Manager
 Integrates with Accio Data XML API to automate fingerprint release form distribution.
@@ -14,7 +15,6 @@ Built with Python standard library + openpyxl for Excel support.
 import os
 import sys
 import json
-import sqlite3
 import smtplib
 import logging
 import urllib.parse
@@ -33,6 +33,14 @@ from xml.etree import ElementTree as ET
 from string import Template
 
 try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PG = True
+except ImportError:
+    HAS_PG = False
+    print("WARNING: psycopg2 not installed. Install with: pip install psycopg2-binary")
+
+try:
     import openpyxl
     HAS_OPENPYXL = True
 except ImportError:
@@ -44,7 +52,7 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "fingerprint.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 WATCH_FOLDER = os.path.join(BASE_DIR, "watch")  # Drop Excel files here for auto-import
 PROCESSED_FOLDER = os.path.join(BASE_DIR, "watch", "processed")  # Auto-imported files move here
@@ -63,22 +71,38 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
+class DBHelper:
+    """Wrapper to provide sqlite3-like interface over psycopg2."""
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        cur = self._conn.cursor()
+        cur.execute(sql, params or ())
+        return cur
+
+    def commit(self):
+        pass  # autocommit is on
+
+    def close(self):
+        self._conn.close()
+
 def get_db():
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA foreign_keys=ON")
-    return db
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = True
+    return DBHelper(conn)
 
 def init_db():
     db = get_db()
-    db.executescript("""
+    cur = db.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        );
+        )
+    """)
+    cur = db.execute("""
         CREATE TABLE IF NOT EXISTS applicants (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             first_name TEXT NOT NULL,
             last_name TEXT NOT NULL,
             email TEXT,
@@ -87,42 +111,46 @@ def init_db():
             accio_remote_number TEXT,
             status TEXT DEFAULT 'pending',
             assigned_code TEXT,
-            email_sent INTEGER DEFAULT 0,
-            email_sent_at TEXT,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now')),
+            email_sent BOOLEAN DEFAULT FALSE,
+            email_sent_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
             notes TEXT
-        );
+        )
+    """)
+    cur = db.execute("""
         CREATE TABLE IF NOT EXISTS codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             code TEXT NOT NULL UNIQUE,
             status TEXT DEFAULT 'available',
-            assigned_to INTEGER,
-            assigned_at TEXT,
-            imported_at TEXT DEFAULT (datetime('now')),
-            batch_name TEXT,
-            FOREIGN KEY (assigned_to) REFERENCES applicants(id)
-        );
+            assigned_to INTEGER REFERENCES applicants(id),
+            assigned_at TIMESTAMP,
+            assigned_date TIMESTAMP,
+            imported_at TIMESTAMP DEFAULT NOW(),
+            batch_name TEXT
+        )
+    """)
+    cur = db.execute("""
         CREATE TABLE IF NOT EXISTS email_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            applicant_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            applicant_id INTEGER REFERENCES applicants(id),
             recipient_email TEXT,
             subject TEXT,
             status TEXT,
             error_message TEXT,
-            sent_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (applicant_id) REFERENCES applicants(id)
-        );
+            sent_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur = db.execute("""
         CREATE TABLE IF NOT EXISTS xml_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             direction TEXT,
             raw_xml TEXT,
             parsed_status TEXT,
             error_message TEXT,
-            received_at TEXT DEFAULT (datetime('now'))
-        );
+            received_at TIMESTAMP DEFAULT NOW()
+        )
     """)
-    db.commit()
     db.close()
 
 # ---------------------------------------------------------------------------
@@ -139,7 +167,7 @@ DEFAULT_SETTINGS = {
     "smtp_password": "BRS#mail@_985",
     "smtp_use_tls": "1",
     "sender_email": "apply2check@br-solutions.net",
-    "sender_name": "Fingerprint Release Team",
+    "sender_name": "Fingerprints Required",
     "email_subject": "Your Fingerprint Release Form & Payment Code",
     "email_body": """Dear {first_name} {last_name},
 
@@ -166,14 +194,14 @@ Thank you.""",
 }
 
 def get_setting(db, key):
-    row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    cur = db.execute("SELECT value FROM settings WHERE key = %s", (key,))
+    row = cur.fetchone()
     if row:
         return row["value"]
     return DEFAULT_SETTINGS.get(key, "")
 
 def set_setting(db, key, value):
-    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    db.commit()
+    cur = db.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
 
 # ---------------------------------------------------------------------------
 # XML Parsing
@@ -264,6 +292,64 @@ def parse_accio_xml(xml_string):
                                        phone=phone, accio_order_number="",
                                        accio_remote_number=""))
 
+    # --- Format 5: AccioOrder XML format ---
+    if not applicants:
+        for order in root.iter("order"):
+            order_number = order.get("number", "")
+            remote_number = order.get("remote_order", "")
+            for subject in order.iter("subject"):
+                first = _xt(subject, "name_first")
+                last = _xt(subject, "name_last")
+                # Try multiple email tag variations
+                email = (_xt(subject, "email") or _xt(subject, "Email") or
+                        _xt(subject, "InternetEmailAddress") or _xt(subject, "email_address") or
+                        _xt(subject, "EmailAddress") or _xt(subject, "e_mail") or
+                        _xt(subject, "applicant_email") or _xt(subject, "candidate_email") or
+                        _xt(subject, "contact_email"))
+                # Try multiple phone tag variations
+                phone = (_xt(subject, "phone") or _xt(subject, "Phone") or
+                        _xt(subject, "phone_number") or _xt(subject, "PhoneNumber") or
+                        _xt(subject, "FormattedNumber") or _xt(subject, "telephone") or
+                        _xt(subject, "contact_phone") or _xt(subject, "home_phone") or
+                        _xt(subject, "cell_phone") or _xt(subject, "mobile"))
+                if first or last:
+                    applicants.append(dict(first_name=first, last_name=last, email=email,
+                                           phone=phone, accio_order_number=order_number,
+                                           accio_remote_number=remote_number))
+
+    # --- Deep scan fallback: look for name_first/name_last pairs anywhere ---
+    if not applicants:
+        def deep_scan_for_applicants(elem, parent_map=None):
+            found = []
+            if parent_map is None:
+                parent_map = {c: p for p in elem.iter() for c in p}
+
+            for el in elem.iter():
+                if el.tag == "name_first" and el.text:
+                    first = el.text.strip()
+                    # Look for nearby name_last in same parent
+                    parent = parent_map.get(el)
+                    if parent is not None:
+                        last = _xt(parent, "name_last")
+                        email = ""
+                        phone = ""
+                        # Try to find email and phone in parent or siblings
+                        for tag_variant in ["email", "Email", "InternetEmailAddress", "email_address", "EmailAddress", "e_mail", "applicant_email", "candidate_email", "contact_email"]:
+                            email = _xt(parent, tag_variant)
+                            if email:
+                                break
+                        for tag_variant in ["phone", "Phone", "phone_number", "PhoneNumber", "FormattedNumber", "telephone", "contact_phone", "home_phone", "cell_phone", "mobile"]:
+                            phone = _xt(parent, tag_variant)
+                            if phone:
+                                break
+                        if first or last:
+                            found.append(dict(first_name=first, last_name=last, email=email,
+                                            phone=phone, accio_order_number="",
+                                            accio_remote_number=""))
+            return found
+
+        applicants = deep_scan_for_applicants(root)
+
     return applicants, None
 
 def _xt(el, tag):
@@ -274,7 +360,7 @@ def _xt(el, tag):
 # Email
 # ---------------------------------------------------------------------------
 def send_release_email(db, applicant_id):
-    a = db.execute("SELECT * FROM applicants WHERE id = ?", (applicant_id,)).fetchone()
+    a = db.execute("SELECT * FROM applicants WHERE id = %s", (applicant_id,)).fetchone()
     if not a: return False, "Applicant not found"
     if not a["email"]: return False, "No email address"
     if not a["assigned_code"]: return False, "No code assigned"
@@ -323,18 +409,18 @@ def send_release_email(db, applicant_id):
         srv.quit()
 
         now = datetime.now().isoformat()
-        db.execute("UPDATE applicants SET email_sent=1, email_sent_at=?, status='emailed', updated_at=? WHERE id=?", (now, now, applicant_id))
-        db.execute("INSERT INTO email_log (applicant_id,recipient_email,subject,status) VALUES (?,?,?,'sent')", (applicant_id, a["email"], subj))
+        db.execute("UPDATE applicants SET email_sent=1, email_sent_at=%s, status='emailed', updated_at=%s WHERE id = %s", (now, now, applicant_id))
+        db.execute("INSERT INTO email_log (applicant_id,recipient_email,subject,status) VALUES (%s,%s,%s,'sent')", (applicant_id, a["email"], subj))
         db.commit()
         return True, "Email sent"
     except Exception as e:
-        db.execute("INSERT INTO email_log (applicant_id,recipient_email,subject,status,error_message) VALUES (?,?,?,'failed',?)",
+        db.execute("INSERT INTO email_log (applicant_id,recipient_email,subject,status,error_message) VALUES (%s,%s,%s,'failed',%s)",
                    (applicant_id, a["email"], subj, str(e)))
         db.commit()
         return False, str(e)
 
 def assign_code(db, applicant_id):
-    a = db.execute("SELECT * FROM applicants WHERE id=?", (applicant_id,)).fetchone()
+    a = db.execute("SELECT * FROM applicants WHERE id = %s", (applicant_id,)).fetchone()
     if not a: return None, "Not found"
     if a["assigned_code"]: return a["assigned_code"], "Already assigned"
 
@@ -342,8 +428,8 @@ def assign_code(db, applicant_id):
     if not code_row: return None, "No codes available"
 
     now = datetime.now().isoformat()
-    db.execute("UPDATE codes SET status='assigned', assigned_to=?, assigned_at=? WHERE id=?", (applicant_id, now, code_row["id"]))
-    db.execute("UPDATE applicants SET assigned_code=?, status='code_assigned', updated_at=? WHERE id=?", (code_row["code"], now, applicant_id))
+    db.execute("UPDATE codes SET status='assigned', assigned_to=%s, assigned_at=%s WHERE id = %s", (applicant_id, now, code_row["id"]))
+    db.execute("UPDATE applicants SET assigned_code=%s, status='code_assigned', updated_at=%s WHERE id = %s", (code_row["code"], now, applicant_id))
     db.commit()
     return code_row["code"], "Assigned"
 
@@ -393,16 +479,13 @@ def import_codes_from_file(filepath, column_index=0, skip_header=True, batch_nam
     imported = 0
     duplicates = 0
     try:
-        db.execute("BEGIN TRANSACTION")
         for code in codes:
             try:
-                db.execute("INSERT INTO codes (code, batch_name) VALUES (?, ?)", (code, batch_name))
+                db.execute("INSERT INTO codes (code, batch_name) VALUES (%s, %s)", (code, batch_name))
                 imported += 1
-            except sqlite3.IntegrityError:
+            except psycopg2.IntegrityError:
                 duplicates += 1
-        db.execute("COMMIT")
     except Exception as e:
-        db.execute("ROLLBACK")
         db.close()
         return imported, duplicates, str(e)
 
@@ -608,12 +691,12 @@ def render_flashes():
 # ---------------------------------------------------------------------------
 def page_dashboard(db):
     stats = {
-        "total": db.execute("SELECT COUNT(*) FROM applicants").fetchone()[0],
-        "pending": db.execute("SELECT COUNT(*) FROM applicants WHERE status='pending'").fetchone()[0],
-        "assigned": db.execute("SELECT COUNT(*) FROM applicants WHERE status='code_assigned'").fetchone()[0],
-        "emailed": db.execute("SELECT COUNT(*) FROM applicants WHERE status='emailed'").fetchone()[0],
-        "avail_codes": db.execute("SELECT COUNT(*) FROM codes WHERE status='available'").fetchone()[0],
-        "used_codes": db.execute("SELECT COUNT(*) FROM codes WHERE status='assigned'").fetchone()[0],
+        "total": db.execute("SELECT COUNT(*) as cnt FROM applicants").fetchone()["cnt"],
+        "pending": db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='pending'").fetchone()["cnt"],
+        "assigned": db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='code_assigned'").fetchone()["cnt"],
+        "emailed": db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='emailed'").fetchone()["cnt"],
+        "avail_codes": db.execute("SELECT COUNT(*) as cnt FROM codes WHERE status='available'").fetchone()["cnt"],
+        "used_codes": db.execute("SELECT COUNT(*) as cnt FROM codes WHERE status='assigned'").fetchone()["cnt"],
     }
     rows = db.execute("SELECT * FROM applicants ORDER BY created_at DESC LIMIT 25").fetchall()
 
@@ -657,14 +740,14 @@ def page_applicants(db, params):
     p = []
     conds = []
     if sf != "all":
-        conds.append("status=?"); p.append(sf)
+        conds.append("status=%s"); p.append(sf)
     if search:
-        conds.append("(first_name LIKE ? OR last_name LIKE ? OR email LIKE ? OR accio_order_number LIKE ?)")
+        conds.append("(first_name LIKE %s OR last_name LIKE %s OR email LIKE %s OR accio_order_number LIKE %s)")
         p.extend([f"%{search}%"]*4)
     if conds:
         q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY created_at DESC"
-    rows = db.execute(q, p).fetchall()
+    rows = db.execute(q, tuple(p) if p else None).fetchall()
 
     c = render_flashes()
     c += f"""<div class="ph"><h1>Applicants</h1><div class="acts">
@@ -739,13 +822,13 @@ def page_codes(db, params):
            FROM codes LEFT JOIN applicants ON codes.assigned_to=applicants.id"""
     p = []
     if sf != "all":
-        q += " WHERE codes.status=?"; p.append(sf)
+        q += " WHERE codes.status=%s"; p.append(sf)
     q += " ORDER BY codes.id DESC"
-    rows = db.execute(q, p).fetchall()
+    rows = db.execute(q, tuple(p) if p else None).fetchall()
     stats = {
-        "total": db.execute("SELECT COUNT(*) FROM codes").fetchone()[0],
-        "avail": db.execute("SELECT COUNT(*) FROM codes WHERE status='available'").fetchone()[0],
-        "assigned": db.execute("SELECT COUNT(*) FROM codes WHERE status='assigned'").fetchone()[0],
+        "total": db.execute("SELECT COUNT(*) as cnt FROM codes").fetchone()["cnt"],
+        "avail": db.execute("SELECT COUNT(*) as cnt FROM codes WHERE status='available'").fetchone()["cnt"],
+        "assigned": db.execute("SELECT COUNT(*) as cnt FROM codes WHERE status='assigned'").fetchone()["cnt"],
     }
 
     c = render_flashes()
@@ -1001,22 +1084,30 @@ class Handler(BaseHTTPRequestHandler):
                 if not auth_valid and raw.strip():
                     try:
                         auth_root = ET.fromstring(raw)
-                        # Check for account/username/password elements at various levels
-                        for parent in [auth_root] + list(auth_root):
-                            xml_user = None
-                            xml_pass = None
-                            xml_acct = None
-                            for el in parent.iter():
-                                tag = el.tag.lower() if el.tag else ""
-                                if tag in ("username", "user", "remote_username"):
-                                    xml_user = (el.text or "").strip()
-                                elif tag in ("password", "pass", "remote_password"):
-                                    xml_pass = (el.text or "").strip()
-                                elif tag in ("account", "remote_account", "acctid"):
-                                    xml_acct = (el.text or "").strip()
+                        # First check for explicit <login> element (AccioOrder format)
+                        login_elem = auth_root.find("login")
+                        if login_elem is not None:
+                            xml_user = (login_elem.findtext("username") or "").strip()
+                            xml_pass = (login_elem.findtext("password") or "").strip()
                             if xml_user == ACCIO_USERNAME and xml_pass == ACCIO_PASSWORD:
                                 auth_valid = True
-                                break
+                        # Check for account/username/password elements at various levels
+                        if not auth_valid:
+                            for parent in [auth_root] + list(auth_root):
+                                xml_user = None
+                                xml_pass = None
+                                xml_acct = None
+                                for el in parent.iter():
+                                    tag = el.tag.lower() if el.tag else ""
+                                    if tag in ("username", "user", "remote_username"):
+                                        xml_user = (el.text or "").strip()
+                                    elif tag in ("password", "pass", "remote_password"):
+                                        xml_pass = (el.text or "").strip()
+                                    elif tag in ("account", "remote_account", "acctid"):
+                                        xml_acct = (el.text or "").strip()
+                                if xml_user == ACCIO_USERNAME and xml_pass == ACCIO_PASSWORD:
+                                    auth_valid = True
+                                    break
                         # Also check root element attributes
                         if not auth_valid:
                             root_user = auth_root.get("username") or auth_root.get("user") or ""
@@ -1040,18 +1131,18 @@ class Handler(BaseHTTPRequestHandler):
                     all_headers = {k: v for k, v in self.headers.items() if k.lower() != "authorization"}
                     logging.warning(f"Auth failed. Headers: {all_headers}")
                     logging.warning(f"Auth failed. Body preview: {raw[:500]}")
-                    db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status,error_message) VALUES ('inbound',?,'auth_failed','Authentication failed - check vendor credentials')", (raw[:10000],))
+                    db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status,error_message) VALUES ('inbound',%s,'auth_failed','Authentication failed - check vendor credentials')", (raw[:10000],))
                     db.commit()
                     self._send(401, '<?xml version="1.0" encoding="UTF-8"?>\n<BackgroundReports><error>Authentication required</error></BackgroundReports>', "text/xml")
                     return
                 # Auth passed - log and process
                 logging.info(f"Accio push auth PASSED. Processing XML ({len(raw)} bytes)...")
-                db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status) VALUES ('inbound',?,'processing')", (raw[:10000],))
+                db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status) VALUES ('inbound',%s,'processing')", (raw[:10000],))
                 db.commit()
                 applicants_data, err = parse_accio_xml(raw)
                 if err:
                     logging.error(f"XML parse error: {err}")
-                    db.execute("UPDATE xml_log SET parsed_status='error',error_message=? WHERE id=(SELECT MAX(id) FROM xml_log)", (err,))
+                    db.execute("UPDATE xml_log SET parsed_status='error',error_message=%s WHERE id=(SELECT MAX(id) FROM xml_log)", (err,))
                     db.commit()
                     self._send(400, '<?xml version="1.0" encoding="UTF-8"?>\n<BackgroundReports><error>XML parse error</error></BackgroundReports>', "text/xml")
                     return
@@ -1060,18 +1151,18 @@ class Handler(BaseHTTPRequestHandler):
                 auto_email = get_setting(db, "auto_send_email") == "1"
                 for a in applicants_data:
                     try:
-                        ex = db.execute("SELECT id FROM applicants WHERE accio_order_number=?", (a["accio_order_number"],)).fetchone() if a["accio_order_number"] else None
+                        ex = db.execute("SELECT id FROM applicants WHERE accio_order_number = %s", (a["accio_order_number"],)).fetchone() if a["accio_order_number"] else None
                         if not ex:
-                            db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number) VALUES (?,?,?,?,?,?)",
+                            cur = db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
                                        (a["first_name"],a["last_name"],a["email"],a["phone"],a["accio_order_number"],a["accio_remote_number"]))
-                            new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                            new_id = cur.fetchone()["id"]
                             added += 1
                             # Auto-assign a payment code if enabled
                             if auto_assign:
                                 code_row = db.execute("SELECT id, code FROM codes WHERE assigned_to IS NULL LIMIT 1").fetchone()
                                 if code_row:
-                                    db.execute("UPDATE codes SET assigned_to=?, assigned_date=datetime('now') WHERE id=?", (new_id, code_row["id"]))
-                                    db.execute("UPDATE applicants SET assigned_code=? WHERE id=?", (code_row["code"], new_id))
+                                    db.execute("UPDATE codes SET assigned_to=%s, assigned_date=NOW() WHERE id = %s", (new_id, code_row["id"]))
+                                    db.execute("UPDATE applicants SET assigned_code=%s WHERE id = %s", (code_row["code"], new_id))
                                     db.commit()
                                     # Auto-send email if enabled
                                     if auto_email and a["email"]:
@@ -1081,7 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
                                             logging.error(f"Auto-email failed for applicant {new_id}: {email_err}")
                     except Exception as proc_err:
                         logging.error(f"Error processing applicant: {proc_err}")
-                db.execute("UPDATE xml_log SET parsed_status='success',error_message=? WHERE id=(SELECT MAX(id) FROM xml_log)", (f"Added {added} applicants from {len(applicants_data)} parsed",))
+                db.execute("UPDATE xml_log SET parsed_status='success',error_message=%s WHERE id=(SELECT MAX(id) FROM xml_log)", (f"Added {added} applicants from {len(applicants_data)} parsed",))
                 db.commit()
                 logging.info(f"Accio push complete: {added} added from {len(applicants_data)} parsed")
                 # Respond with Accio-compatible XML acknowledgment
@@ -1098,7 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Catch-all: ALWAYS send a valid response so Accio doesn't get "unable to read response"
                 logging.error(f"CRITICAL: Unhandled exception in accio-push: {e}", exc_info=True)
                 try:
-                    db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status,error_message) VALUES ('inbound','','crash',?)", (str(e)[:5000],))
+                    db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status,error_message) VALUES ('inbound','','crash',%s)", (str(e)[:5000],))
                     db.commit()
                 except Exception:
                     pass
@@ -1117,21 +1208,18 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(400, json.dumps({"status": "error", "message": "No codes provided. Send {\"codes\": [\"CODE1\", \"CODE2\", ...]}"}), "application/json")
                         return
                     imported, dups = 0, 0
-                    db.execute("BEGIN TRANSACTION")
                     for code in codes_list:
                         code = str(code).strip()
                         if code:
                             try:
-                                db.execute("INSERT INTO codes (code, batch_name) VALUES (?, ?)", (code, batch_name))
+                                db.execute("INSERT INTO codes (code, batch_name) VALUES (%s, %s)", (code, batch_name))
                                 imported += 1
-                            except sqlite3.IntegrityError:
+                            except psycopg2.IntegrityError:
                                 dups += 1
-                    db.execute("COMMIT")
                     self._send(200, json.dumps({"status": "success", "imported": imported, "duplicates": dups, "batch": batch_name}), "application/json")
                 except json.JSONDecodeError:
                     self._send(400, json.dumps({"status": "error", "message": "Invalid JSON"}), "application/json")
                 except Exception as e:
-                    db.execute("ROLLBACK")
                     self._send(500, json.dumps({"status": "error", "message": str(e)}), "application/json")
                 return
 
@@ -1171,7 +1259,7 @@ class Handler(BaseHTTPRequestHandler):
                     return vals[0] if vals else default
 
             if path == "/applicants/add":
-                db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,notes) VALUES (?,?,?,?,?,?)",
+                db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,notes) VALUES (%s,%s,%s,%s,%s,%s)",
                            (fv("first_name"), fv("last_name"), fv("email"), fv("phone"), fv("accio_order_number"), fv("notes")))
                 db.commit()
                 flash("Applicant added.", "success")
@@ -1191,7 +1279,7 @@ class Handler(BaseHTTPRequestHandler):
 
             elif path.startswith("/applicants/") and path.endswith("/assign-and-send"):
                 aid = int(path.split("/")[2])
-                a = db.execute("SELECT * FROM applicants WHERE id=?", (aid,)).fetchone()
+                a = db.execute("SELECT * FROM applicants WHERE id = %s", (aid,)).fetchone()
                 if a and not a["assigned_code"]:
                     assign_code(db, aid)
                 ok, msg = send_release_email(db, aid)
@@ -1201,10 +1289,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/applicants/") and path.endswith("/delete"):
                 aid = int(path.split("/")[2])
                 # Free the assigned code back to the pool
-                applicant = db.execute("SELECT assigned_code FROM applicants WHERE id=?", (aid,)).fetchone()
+                applicant = db.execute("SELECT assigned_code FROM applicants WHERE id = %s", (aid,)).fetchone()
                 if applicant and applicant["assigned_code"]:
-                    db.execute("UPDATE codes SET assigned_to=NULL, assigned_date=NULL WHERE code=?", (applicant["assigned_code"],))
-                db.execute("DELETE FROM applicants WHERE id=?", (aid,))
+                    db.execute("UPDATE codes SET assigned_to=NULL, assigned_date=NULL WHERE code = %s", (applicant["assigned_code"],))
+                db.execute("DELETE FROM applicants WHERE id = %s", (aid,))
                 db.commit()
                 flash("Applicant deleted.", "success")
                 self._redirect("/applicants")
@@ -1231,9 +1319,9 @@ class Handler(BaseHTTPRequestHandler):
                     code_str = line.strip()
                     if code_str:
                         try:
-                            db.execute("INSERT INTO codes (code,batch_name) VALUES (?,?)", (code_str, batch))
+                            db.execute("INSERT INTO codes (code,batch_name) VALUES (%s,%s)", (code_str, batch))
                             imp += 1
-                        except sqlite3.IntegrityError:
+                        except psycopg2.IntegrityError:
                             dup += 1
                 db.commit()
                 flash(f"Added {imp} codes ({dup} duplicates skipped).", "success")
