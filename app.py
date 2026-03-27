@@ -976,8 +976,8 @@ class Handler(BaseHTTPRequestHandler):
             # Accio Data XML push endpoint
             if path == "/api/accio-push":
                 # Validate Basic Auth credentials from Accio
-                ACCIO_USERNAME = os.environ.get("ACCIO_USERNAME", "FPrelease")
-                ACCIO_PASSWORD = os.environ.get("ACCIO_PASSWORD", "fingerprint")
+                ACCIO_USERNAME = os.environ.get("ACCIO_USERNAME", "admin")
+                ACCIO_PASSWORD = os.environ.get("ACCIO_PASSWORD", "Fingerprint")
                 auth_header = self.headers.get("Authorization", "")
                 auth_valid = False
                 if auth_header.startswith("Basic "):
