@@ -160,6 +160,8 @@ Thank you.""",
     "release_form_path": "",
     "company_name": "",
     "ori_number": "",
+    "auto_assign_codes": "0",
+    "auto_send_email": "0",
 }
 
 def get_setting(db, key):
@@ -182,6 +184,7 @@ def parse_accio_xml(xml_string):
     except ET.ParseError as e:
         return applicants, str(e)
 
+    # --- Format 1: ScreeningResults (completeOrder / placeOrder) ---
     for complete_order in root.iter("completeOrder"):
         order_number = complete_order.get("number", "")
         remote_number = complete_order.get("remote_number", "")
@@ -205,6 +208,61 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=po.get("number", ""),
                                        accio_remote_number=""))
+
+    # --- Format 2: Action Letter XML Post (postLetter with orderInfo) ---
+    for post_letter in root.iter("postLetter"):
+        order_number = post_letter.get("remote_order", "") or post_letter.get("order", "")
+        remote_order = post_letter.get("remote_order", "")
+        order_info = post_letter.find("orderInfo")
+        if order_info is not None:
+            first = _xt(order_info, "name_first")
+            last = _xt(order_info, "name_last")
+            email = _xt(order_info, "email")
+            phone = _xt(order_info, "phone_number") or _xt(order_info, "phone")
+            # Also check requester fields as fallback for contact info
+            if not email:
+                email = _xt(order_info, "requester_email")
+            if not phone:
+                phone = _xt(order_info, "requester_phone")
+            if first or last:
+                applicants.append(dict(first_name=first, last_name=last, email=email,
+                                       phone=phone, accio_order_number=order_number,
+                                       accio_remote_number=remote_order))
+
+    # --- Format 3: Vendor dispatch XML (orderRequest with subject) ---
+    for order_req in root.iter("orderRequest"):
+        order_number = order_req.get("order", "") or order_req.get("number", "")
+        remote_number = order_req.get("remote_order", "")
+        for subject in order_req.iter("subject"):
+            first = _xt(subject, "name_first") or _xt(subject, "firstName")
+            last = _xt(subject, "name_last") or _xt(subject, "lastName")
+            email = _xt(subject, "email") or _xt(subject, "InternetEmailAddress")
+            phone = _xt(subject, "phone") or _xt(subject, "phone_number")
+            if first or last:
+                applicants.append(dict(first_name=first, last_name=last, email=email,
+                                       phone=phone, accio_order_number=order_number,
+                                       accio_remote_number=remote_number))
+
+    # --- Format 4: Generic fallback - look for PersonalData or BackgroundSearchPackage ---
+    if not applicants:
+        for pd in root.iter("PersonalData"):
+            pn = pd.find("PersonName")
+            cm = pd.find("ContactMethod")
+            first = ""
+            last = ""
+            email = ""
+            phone = ""
+            if pn is not None:
+                first = _xt(pn, "GivenName") or _xt(pn, "name_first")
+                last = _xt(pn, "FamilyName") or _xt(pn, "name_last")
+            if cm is not None:
+                email = _xt(cm, "InternetEmailAddress") or _xt(cm, "email")
+                phone = _xt(cm, "FormattedNumber") or _xt(cm, "phone")
+            if first or last:
+                applicants.append(dict(first_name=first, last_name=last, email=email,
+                                       phone=phone, accio_order_number="",
+                                       accio_remote_number=""))
+
     return applicants, None
 
 def _xt(el, tag):
@@ -767,8 +825,9 @@ def page_settings(db):
     <div class="fr"><div class="fg"><label>Password</label><input type="password" name="accio_password" value="{h(s["accio_password"])}"></div>
     <div class="fg"><label>Accio Post URL</label><input name="accio_post_url" value="{h(s["accio_post_url"])}"></div></div>
     <hr class="div"><h4 style="font-size:13px;margin-bottom:6px">Your Push Endpoint</h4>
-    <p style="font-size:12px;color:var(--g500)">Set this as <strong>XMLresults_post_url</strong> in Accio Data:</p>
-    <div class="api-box">https://YOUR_SERVER/api/accio-push</div></div></div>
+    <p style="font-size:12px;color:var(--g500)">Set this URL in Accio Data (XML Post URL for Action Letters or XMLresults_post_url):</p>
+    <div class="api-box">https://fingerprint-release-manager1.onrender.com/api/accio-push</div>
+    <div class="ht" style="margin-top:8px">Supports: ScreeningResults XML, Action Letter XML Post (postLetter), Vendor dispatch XML, and HR-XML PersonalData formats.</div></div></div>
 
     <div class="cd"><div class="cd-h"><h3><i class="fas fa-building"></i> Company</h3></div><div class="cd-b">
     <div class="fr"><div class="fg"><label>Company Name</label><input name="company_name" value="{h(s["company_name"])}"></div>
@@ -792,6 +851,16 @@ def page_settings(db):
     else:
         c += '<div class="ht">Upload your fingerprint release form PDF to attach to emails.</div>'
     c += f"""</div></div></div>
+
+    <div class="cd"><div class="cd-h"><h3><i class="fas fa-robot"></i> Automation</h3></div><div class="cd-b">
+    <div class="fg"><label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer">
+    <input type="hidden" name="auto_assign_codes" value="0">
+    <input type="checkbox" name="auto_assign_codes" value="1" {"checked" if s["auto_assign_codes"]=="1" else ""} style="width:auto"> Auto-assign payment code when applicant is received from Accio</label>
+    <div class="ht">When enabled, the next available IdentoGO code is automatically assigned to each new applicant received via XML push.</div></div>
+    <div class="fg"><label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer">
+    <input type="hidden" name="auto_send_email" value="0">
+    <input type="checkbox" name="auto_send_email" value="1" {"checked" if s["auto_send_email"]=="1" else ""} style="width:auto"> Auto-send release email after code assignment</label>
+    <div class="ht">When enabled, the fingerprint release email (with PDF and payment code) is sent automatically. Requires auto-assign to also be on and SMTP to be configured.</div></div></div></div>
 
     <div class="cd"><div class="cd-h"><h3><i class="fas fa-edit"></i> Email Template</h3></div><div class="cd-b">
     <div class="fg"><label>Subject</label><input name="email_subject" value="{h(s["email_subject"])}">
@@ -913,18 +982,35 @@ class Handler(BaseHTTPRequestHandler):
                 if err:
                     db.execute("UPDATE xml_log SET parsed_status='error',error_message=? WHERE id=(SELECT MAX(id) FROM xml_log)", (err,))
                     db.commit()
-                    self._send(400, f'<?xml version="1.0"?><response><status>error</status></response>', "text/xml")
+                    self._send(400, '<?xml version="1.0" encoding="UTF-8"?>\n<XML><error>XML parse error</error></XML>', "text/xml")
                     return
                 added = 0
+                auto_assign = get_setting(db, "auto_assign_codes") == "1"
+                auto_email = get_setting(db, "auto_send_email") == "1"
                 for a in applicants_data:
                     ex = db.execute("SELECT id FROM applicants WHERE accio_order_number=?", (a["accio_order_number"],)).fetchone() if a["accio_order_number"] else None
                     if not ex:
                         db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number) VALUES (?,?,?,?,?,?)",
                                    (a["first_name"],a["last_name"],a["email"],a["phone"],a["accio_order_number"],a["accio_remote_number"]))
+                        new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
                         added += 1
+                        # Auto-assign a payment code if enabled
+                        if auto_assign:
+                            code_row = db.execute("SELECT id, code FROM codes WHERE assigned_to IS NULL LIMIT 1").fetchone()
+                            if code_row:
+                                db.execute("UPDATE codes SET assigned_to=?, assigned_date=datetime('now') WHERE id=?", (new_id, code_row["id"]))
+                                db.execute("UPDATE applicants SET assigned_code=? WHERE id=?", (code_row["code"], new_id))
+                                db.commit()
+                                # Auto-send email if enabled
+                                if auto_email and a["email"]:
+                                    try:
+                                        send_release_email(db, new_id)
+                                    except Exception:
+                                        pass
                 db.execute("UPDATE xml_log SET parsed_status='success' WHERE id=(SELECT MAX(id) FROM xml_log)")
                 db.commit()
-                self._send(200, f'<?xml version="1.0"?><response><status>success</status><count>{added}</count></response>', "text/xml")
+                # Respond with Accio-compatible XML (no <error> node = accepted)
+                self._send(200, '<?xml version="1.0" encoding="UTF-8"?>\n<XML></XML>', "text/xml")
                 return
 
             # API: Bulk code upload (JSON)
