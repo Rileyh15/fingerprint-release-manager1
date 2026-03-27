@@ -1053,6 +1053,36 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, page_settings(db))
             elif path == "/logs":
                 self._send(200, page_logs(db))
+            elif path == "/api/debug-xml":
+                # Return the full raw XML from the most recent xml_log entry
+                row = db.execute("SELECT raw_xml FROM xml_log ORDER BY id DESC LIMIT 1").fetchone()
+                if row and row["raw_xml"]:
+                    self._send(200, row["raw_xml"], "text/xml")
+                else:
+                    self._send(200, "No XML logs found", "text/plain")
+                return
+            elif path == "/api/debug-xml-tags":
+                # Return all unique XML tag names from most recent log
+                row = db.execute("SELECT raw_xml FROM xml_log ORDER BY id DESC LIMIT 1").fetchone()
+                if row and row["raw_xml"]:
+                    try:
+                        xroot = ET.fromstring(row["raw_xml"])
+                        tags = set()
+                        tag_tree = []
+                        for el in xroot.iter():
+                            tags.add(el.tag)
+                            depth = 0
+                            parent = el
+                            text_preview = (el.text or "").strip()[:50]
+                            tag_tree.append(f"{el.tag} = '{text_preview}'" if text_preview else el.tag)
+                        result = "=== ALL UNIQUE TAGS ===\n" + "\n".join(sorted(tags))
+                        result += "\n\n=== FULL TAG TREE WITH VALUES ===\n" + "\n".join(tag_tree)
+                        self._send(200, result, "text/plain")
+                    except Exception as e:
+                        self._send(200, f"Parse error: {e}", "text/plain")
+                else:
+                    self._send(200, "No XML logs found", "text/plain")
+                return
             else:
                 self._send(404, render_page("Not Found", '<div class="es"><i class="fas fa-exclamation-triangle"></i><h3>Page not found</h3></div>'))
         finally:
@@ -1144,6 +1174,17 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 # Auth passed - log and process
                 logging.info(f"Accio push auth PASSED. Processing XML ({len(raw)} bytes)...")
+                # DEBUG: Log all XML tag names and their text values to help identify email/phone fields
+                try:
+                    debug_root = ET.fromstring(raw)
+                    for el in debug_root.iter():
+                        txt = (el.text or "").strip()
+                        if txt:
+                            logging.info(f"  XML TAG: <{el.tag}> = '{txt[:80]}'")
+                        else:
+                            logging.info(f"  XML TAG: <{el.tag}>")
+                except Exception:
+                    pass
                 db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status) VALUES ('inbound',%s,'processing')", (raw[:10000],))
                 db.commit()
                 applicants_data, err = parse_accio_xml(raw)
