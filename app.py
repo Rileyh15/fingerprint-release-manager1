@@ -1,12 +1,21 @@
 """
-Fingerprint Release Manager
+Fingerprint Release Manager - v2.0
 Integrates with Accio Data XML API to automate fingerprint release form distribution.
+
+New Features:
+- Multi-user login system with session management
+- Client tracking from Accio XML
+- Dashboard with analytics
+- Email open tracking with pixels
+- Applicant status workflow
+- Clients management page
 
 Workflow:
 1. Receives applicant data via XML push from Accio Data (or manual entry)
 2. Manages a pool of IdentoGO one-time payment codes (imported from Excel)
 3. Assigns a code to each applicant
 4. Emails the applicant their fingerprint release form PDF with their assigned code
+5. Tracks email opens and applicant status
 
 Built with Python standard library + openpyxl for Excel support.
 """
@@ -22,7 +31,9 @@ import io
 import csv
 import shutil
 import base64
-from datetime import datetime
+import uuid
+import hashlib
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -100,6 +111,37 @@ def init_db():
         )
     """)
     cur = db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            display_name TEXT,
+            role TEXT DEFAULT 'user',
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            last_login TIMESTAMP
+        )
+    """)
+    cur = db.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id),
+            created_at TIMESTAMP DEFAULT NOW(),
+            expires_at TIMESTAMP
+        )
+    """)
+    cur = db.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            id SERIAL PRIMARY KEY,
+            company_name TEXT NOT NULL,
+            account_name TEXT,
+            contact_email TEXT,
+            contact_phone TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            applicant_count INTEGER DEFAULT 0
+        )
+    """)
+    cur = db.execute("""
         CREATE TABLE IF NOT EXISTS applicants (
             id SERIAL PRIMARY KEY,
             first_name TEXT NOT NULL,
@@ -114,7 +156,8 @@ def init_db():
             email_sent_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW(),
-            notes TEXT
+            notes TEXT,
+            client_id INTEGER REFERENCES clients(id)
         )
     """)
     cur = db.execute("""
@@ -141,6 +184,17 @@ def init_db():
         )
     """)
     cur = db.execute("""
+        CREATE TABLE IF NOT EXISTS email_tracking (
+            id SERIAL PRIMARY KEY,
+            applicant_id INTEGER REFERENCES applicants(id),
+            email_log_id INTEGER REFERENCES email_log(id),
+            tracking_token TEXT UNIQUE NOT NULL,
+            opened_at TIMESTAMP,
+            open_count INTEGER DEFAULT 0,
+            user_agent TEXT
+        )
+    """)
+    cur = db.execute("""
         CREATE TABLE IF NOT EXISTS xml_log (
             id SERIAL PRIMARY KEY,
             direction TEXT,
@@ -150,6 +204,28 @@ def init_db():
             received_at TIMESTAMP DEFAULT NOW()
         )
     """)
+
+    # Add new columns to existing tables if they don't exist
+    try:
+        db.execute("ALTER TABLE applicants ADD COLUMN client_id INTEGER REFERENCES clients(id)")
+    except psycopg2.Error:
+        pass  # Column already exists
+
+    db.close()
+
+    # Create default admin user if no users exist
+    db = get_db()
+    users = db.execute("SELECT COUNT(*) as cnt FROM users").fetchone()
+    if users["cnt"] == 0:
+        salt = os.urandom(32)
+        admin_hash = hashlib.sha256(b"admin123" + salt).hexdigest()
+        salt_b64 = base64.b64encode(salt).decode()
+        password_with_salt = f"{admin_hash}${salt_b64}"
+        db.execute(
+            "INSERT INTO users (username, password_hash, display_name, role, is_active) VALUES (%s, %s, %s, %s, %s)",
+            ("admin", password_with_salt, "Administrator", "admin", True)
+        )
+        logger.info("Created default admin user: admin / admin123")
     db.close()
 
 # ---------------------------------------------------------------------------
@@ -203,6 +279,59 @@ def set_setting(db, key, value):
     cur = db.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
 
 # ---------------------------------------------------------------------------
+# Authentication & Session Management
+# ---------------------------------------------------------------------------
+def hash_password(password, salt=None):
+    """Hash a password with salt (sha256)."""
+    if salt is None:
+        salt = os.urandom(32)
+    else:
+        salt = base64.b64decode(salt)
+    h = hashlib.sha256(password.encode() + salt).hexdigest()
+    salt_b64 = base64.b64encode(salt).decode()
+    return f"{h}${salt_b64}"
+
+def verify_password(password, password_with_salt):
+    """Verify a password against a hash."""
+    try:
+        h, salt_b64 = password_with_salt.split("$", 1)
+        salt = base64.b64decode(salt_b64)
+        computed = hashlib.sha256(password.encode() + salt).hexdigest()
+        return computed == h
+    except Exception:
+        return False
+
+def create_session(db, user_id):
+    """Create a new session token for a user."""
+    token = str(uuid.uuid4())
+    expires_at = (datetime.now() + timedelta(hours=24)).isoformat()
+    db.execute(
+        "INSERT INTO sessions (token, user_id, expires_at) VALUES (%s, %s, %s)",
+        (token, user_id, expires_at)
+    )
+    return token
+
+def verify_session(db, token):
+    """Verify a session token and return user data if valid."""
+    if not token:
+        return None
+    cur = db.execute(
+        "SELECT u.* FROM users u JOIN sessions s ON u.id = s.user_id WHERE s.token = %s AND s.expires_at > NOW()",
+        (token,)
+    )
+    return cur.fetchone()
+
+def get_session_from_cookie(cookie_header):
+    """Extract session token from cookie header."""
+    if not cookie_header:
+        return None
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if part.startswith("session_token="):
+            return part.split("=", 1)[1]
+    return None
+
+# ---------------------------------------------------------------------------
 # XML Parsing
 # ---------------------------------------------------------------------------
 def parse_accio_xml(xml_string):
@@ -224,18 +353,48 @@ def parse_accio_xml(xml_string):
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
-                                       accio_remote_number=remote_number))
+                                       accio_remote_number=remote_number, company_name=""))
 
     for po in root.iter("placeOrder"):
+        # Get company name from accountInfo
+        company_name = ""
+        ai = po.find("accountInfo")
+        if ai is not None:
+            company_name = _xt(ai, "company_name")
+        # Get account from clientInfo
+        account_name = ""
+        ci = po.find("clientInfo")
+        if ci is not None:
+            account_name = _xt(ci, "account")
+
+        # Get email/phone from orderInfo (Accio puts contact info here, not in subject)
+        oi = po.find("orderInfo")
+        oi_email = ""
+        oi_phone = ""
+        if oi is not None:
+            oi_email = _xt(oi, "requester_email")
+            oi_phone = _xt(oi, "requester_phone")
+        # Fallback to clientInfo
+        if not oi_email:
+            if ci is not None:
+                oi_email = _xt(ci, "primaryuser_contact_email")
+                if not oi_phone:
+                    oi_phone = _xt(ci, "primaryuser_contact_telephone")
+        # Fallback to accountInfo
+        if not oi_email:
+            if ai is not None:
+                oi_email = _xt(ai, "primaryuser_contact_email")
+                if not oi_phone:
+                    oi_phone = _xt(ai, "primaryuser_contact_telephone")
         for subject in po.iter("subject"):
             first = _xt(subject, "name_first")
             last = _xt(subject, "name_last")
-            email = _xt(subject, "email")
-            phone = _xt(subject, "phone")
+            email = _xt(subject, "email") or oi_email
+            phone = _xt(subject, "phone") or oi_phone
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=po.get("number", ""),
-                                       accio_remote_number=""))
+                                       accio_remote_number="", company_name=company_name, account_name=account_name))
 
     # --- Format 2: Action Letter XML Post (postLetter with orderInfo) ---
     for post_letter in root.iter("postLetter"):
@@ -255,7 +414,7 @@ def parse_accio_xml(xml_string):
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
-                                       accio_remote_number=remote_order))
+                                       accio_remote_number=remote_order, company_name="", account_name=""))
 
     # --- Format 3: Vendor dispatch XML (orderRequest with subject) ---
     for order_req in root.iter("orderRequest"):
@@ -269,7 +428,7 @@ def parse_accio_xml(xml_string):
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
-                                       accio_remote_number=remote_number))
+                                       accio_remote_number=remote_number, company_name="", account_name=""))
 
     # --- Format 4: Generic fallback - look for PersonalData or BackgroundSearchPackage ---
     if not applicants:
@@ -289,7 +448,7 @@ def parse_accio_xml(xml_string):
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number="",
-                                       accio_remote_number=""))
+                                       accio_remote_number="", company_name="", account_name=""))
 
     # --- Format 5: AccioOrder XML format (placeOrder > subject) ---
     # Accio sends: <AccioOrder><placeOrder number="..."><orderInfo><requester_email>...
@@ -298,6 +457,17 @@ def parse_accio_xml(xml_string):
     if not applicants:
         for place_order in root.iter("placeOrder"):
             order_number = place_order.get("number", "")
+            # Get company name
+            company_name = ""
+            ai = place_order.find("accountInfo")
+            if ai is not None:
+                company_name = _xt(ai, "company_name")
+            # Get account name
+            account_name = ""
+            ci = place_order.find("clientInfo")
+            if ci is not None:
+                account_name = _xt(ci, "account")
+
             # Get email/phone from orderInfo (sibling of subject within placeOrder)
             order_info = place_order.find("orderInfo")
             order_email = ""
@@ -308,17 +478,15 @@ def parse_accio_xml(xml_string):
                 order_phone = (_xt(order_info, "requester_phone") or "")
             # Fallback: try clientInfo or accountInfo
             if not order_email:
-                client_info = place_order.find("clientInfo")
-                if client_info is not None:
-                    order_email = _xt(client_info, "primaryuser_contact_email")
+                if ci is not None:
+                    order_email = _xt(ci, "primaryuser_contact_email")
                     if not order_phone:
-                        order_phone = _xt(client_info, "primaryuser_contact_telephone")
+                        order_phone = _xt(ci, "primaryuser_contact_telephone")
             if not order_email:
-                account_info = place_order.find("accountInfo")
-                if account_info is not None:
-                    order_email = _xt(account_info, "primaryuser_contact_email")
+                if ai is not None:
+                    order_email = _xt(ai, "primaryuser_contact_email")
                     if not order_phone:
-                        order_phone = _xt(account_info, "primaryuser_contact_telephone")
+                        order_phone = _xt(ai, "primaryuser_contact_telephone")
             for subject in place_order.iter("subject"):
                 first = _xt(subject, "name_first")
                 last = _xt(subject, "name_last")
@@ -341,7 +509,7 @@ def parse_accio_xml(xml_string):
                 if first or last:
                     applicants.append(dict(first_name=first, last_name=last, email=email,
                                            phone=phone, accio_order_number=order_number,
-                                           accio_remote_number=""))
+                                           accio_remote_number="", company_name=company_name, account_name=account_name))
 
     # --- Format 5b: Also try <order> tag (older AccioOrder variants) ---
     if not applicants:
@@ -370,7 +538,7 @@ def parse_accio_xml(xml_string):
                 if first or last:
                     applicants.append(dict(first_name=first, last_name=last, email=email,
                                            phone=phone, accio_order_number=order_number,
-                                           accio_remote_number=remote_number))
+                                           accio_remote_number=remote_number, company_name="", account_name=""))
 
     # --- Deep scan fallback: look for name_first/name_last pairs anywhere ---
     if not applicants:
@@ -400,7 +568,7 @@ def parse_accio_xml(xml_string):
                         if first or last:
                             found.append(dict(first_name=first, last_name=last, email=email,
                                             phone=phone, accio_order_number="",
-                                            accio_remote_number=""))
+                                            accio_remote_number="", company_name="", account_name=""))
             return found
 
         applicants = deep_scan_for_applicants(root)
@@ -443,7 +611,22 @@ def send_release_email(db, applicant_id):
     msg["From"] = f"{sender_name} <{sender_email}>"
     msg["To"] = a["email"]
     msg["Subject"] = subj
-    msg.attach(MIMEText(body, "plain"))
+
+    # Create tracking token and insert tracking record
+    tracking_token = str(uuid.uuid4())
+    tracking_pixel = f'<img src="https://fingerprint-release-manager1.onrender.com/api/track/{tracking_token}" width="1" height="1" alt="" />'
+
+    # Convert body to HTML with tracking pixel
+    html_body = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+    <pre style="white-space: pre-wrap; word-wrap: break-word;">{h(body)}</pre>
+    {tracking_pixel}
+    </body>
+    </html>
+    """
+
+    msg.attach(MIMEText(html_body, "html"))
 
     rfp = get_setting(db, "release_form_path")
     if rfp and os.path.exists(rfp):
@@ -464,8 +647,17 @@ def send_release_email(db, applicant_id):
         srv.quit()
 
         now = datetime.now().isoformat()
+        cur = db.execute("INSERT INTO email_log (applicant_id,recipient_email,subject,status) VALUES (%s,%s,%s,'sent') RETURNING id",
+                        (applicant_id, a["email"], subj))
+        email_log_id = cur.fetchone()["id"]
+
+        # Create tracking record
+        db.execute(
+            "INSERT INTO email_tracking (applicant_id, email_log_id, tracking_token) VALUES (%s, %s, %s)",
+            (applicant_id, email_log_id, tracking_token)
+        )
+
         db.execute("UPDATE applicants SET email_sent=1, email_sent_at=%s, status='emailed', updated_at=%s WHERE id = %s", (now, now, applicant_id))
-        db.execute("INSERT INTO email_log (applicant_id,recipient_email,subject,status) VALUES (%s,%s,%s,'sent')", (applicant_id, a["email"], subj))
         db.commit()
         return True, "Email sent"
     except Exception as e:
@@ -478,585 +670,1198 @@ def assign_code(db, applicant_id):
     a = db.execute("SELECT * FROM applicants WHERE id = %s", (applicant_id,)).fetchone()
     if not a: return None, "Not found"
     if a["assigned_code"]: return a["assigned_code"], "Already assigned"
-
-    code_row = db.execute("SELECT * FROM codes WHERE status='available' ORDER BY id LIMIT 1").fetchone()
+    code_row = db.execute("SELECT id, code FROM codes WHERE assigned_to IS NULL LIMIT 1").fetchone()
     if not code_row: return None, "No codes available"
-
     now = datetime.now().isoformat()
-    db.execute("UPDATE codes SET status='assigned', assigned_to=%s, assigned_at=%s WHERE id = %s", (applicant_id, now, code_row["id"]))
+    db.execute("UPDATE codes SET assigned_to=%s, assigned_date=%s WHERE id = %s", (applicant_id, now, code_row["id"]))
     db.execute("UPDATE applicants SET assigned_code=%s, status='code_assigned', updated_at=%s WHERE id = %s", (code_row["code"], now, applicant_id))
     db.commit()
-    return code_row["code"], "Assigned"
+    return code_row["code"], "OK"
 
-# ---------------------------------------------------------------------------
-# Bulk Code Import Engine
-# ---------------------------------------------------------------------------
 def import_codes_from_file(filepath, column_index=0, skip_header=True, batch_name=None):
-    """
-    Import codes from an Excel (.xlsx) or CSV file.
-    Returns (imported_count, duplicate_count, error_message).
-    Optimized for large batches (10,000+).
-    """
-    if batch_name is None:
-        batch_name = os.path.basename(filepath)
-
-    codes = []
-    try:
-        if filepath.endswith(".csv") or filepath.endswith(".txt"):
-            with open(filepath, "r", encoding="utf-8-sig") as f:
-                reader = csv.reader(f)
-                for i, row in enumerate(reader):
-                    if skip_header and i == 0:
-                        continue
-                    if len(row) > column_index and row[column_index].strip():
-                        codes.append(row[column_index].strip())
-        elif HAS_OPENPYXL and (filepath.endswith(".xlsx") or filepath.endswith(".xls")):
-            wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-            ws = wb.active
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if skip_header and i == 0:
-                    continue
-                if len(row) > column_index and row[column_index] is not None:
-                    val = str(row[column_index]).strip()
-                    if val and val.lower() != "none":
-                        codes.append(val)
-            wb.close()
-        else:
-            return 0, 0, "Unsupported file format or openpyxl not installed"
-    except Exception as e:
-        return 0, 0, str(e)
-
-    if not codes:
-        return 0, 0, "No codes found in file"
-
-    # Bulk insert with transaction for speed (important for 10,000+ codes)
-    db = get_db()
     imported = 0
     duplicates = 0
+    error_msg = None
     try:
-        for code in codes:
-            try:
-                db.execute("INSERT INTO codes (code, batch_name) VALUES (%s, %s)", (code, batch_name))
-                imported += 1
-            except psycopg2.IntegrityError:
-                duplicates += 1
+        if filepath.endswith(".xlsx") and HAS_OPENPYXL:
+            wb = openpyxl.load_workbook(filepath)
+            ws = wb.active
+            start_row = 2 if skip_header else 1
+            for row_idx, row in enumerate(ws.iter_rows(min_row=start_row), start=start_row):
+                cell = row[column_index] if column_index < len(row) else None
+                if cell and cell.value:
+                    code = str(cell.value).strip()
+                    if code:
+                        db = get_db()
+                        try:
+                            db.execute("INSERT INTO codes (code, batch_name) VALUES (%s, %s)", (code, batch_name or "Import"))
+                            imported += 1
+                        except psycopg2.IntegrityError:
+                            duplicates += 1
+                        finally:
+                            db.close()
+        else:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                reader = csv.reader(f)
+                if skip_header:
+                    next(reader, None)
+                for row in reader:
+                    if column_index < len(row):
+                        code = row[column_index].strip()
+                        if code:
+                            db = get_db()
+                            try:
+                                db.execute("INSERT INTO codes (code, batch_name) VALUES (%s, %s)", (code, batch_name or "Import"))
+                                imported += 1
+                            except psycopg2.IntegrityError:
+                                duplicates += 1
+                            finally:
+                                db.close()
     except Exception as e:
-        db.close()
-        return imported, duplicates, str(e)
-
-    db.close()
-    logger.info(f"Imported {imported} codes ({duplicates} duplicates) from {batch_name}")
-    return imported, duplicates, None
-
+        error_msg = str(e)
+    return imported, duplicates, error_msg
 
 def auto_detect_code_column(filepath):
-    """
-    Automatically detect which column contains the codes by looking at headers
-    and data patterns. Returns the column index (0-based).
-    """
-    try:
-        if filepath.endswith(".csv") or filepath.endswith(".txt"):
-            with open(filepath, "r", encoding="utf-8-sig") as f:
+    """Try to guess which column has the payment codes."""
+    if filepath.endswith(".xlsx") and HAS_OPENPYXL:
+        wb = openpyxl.load_workbook(filepath)
+        ws = wb.active
+        for col_idx, cell in enumerate(ws[1]):
+            if cell.value and ("code" in str(cell.value).lower() or "payment" in str(cell.value).lower()):
+                return col_idx
+    else:
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
                 if header:
-                    for i, col in enumerate(header):
-                        col_lower = col.lower().strip()
-                        if any(kw in col_lower for kw in ["code", "voucher", "token", "payment", "ncac", "identogo"]):
-                            return i
-                # If no keyword match, check first data row for code-like patterns
-                first_row = next(reader, None)
-                if first_row:
-                    for i, val in enumerate(first_row):
-                        val = str(val).strip()
-                        if len(val) >= 6 and any(c.isalpha() for c in val) and any(c.isdigit() for c in val):
-                            return i
-        elif HAS_OPENPYXL:
-            wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-            ws = wb.active
-            rows = list(ws.iter_rows(values_only=True, max_row=3))
-            wb.close()
-            if rows:
-                header = rows[0]
-                for i, col in enumerate(header):
-                    if col:
-                        col_lower = str(col).lower().strip()
-                        if any(kw in col_lower for kw in ["code", "voucher", "token", "payment", "ncac", "identogo"]):
-                            return i
-                # Check data row for alphanumeric patterns
-                if len(rows) > 1:
-                    for i, val in enumerate(rows[1]):
-                        if val:
-                            val = str(val).strip()
-                            if len(val) >= 6 and any(c.isalpha() for c in val) and any(c.isdigit() for c in val):
-                                return i
-    except Exception:
-        pass
-    return 0  # Default to first column
+                    for col_idx, cell in enumerate(header):
+                        if "code" in cell.lower() or "payment" in cell.lower():
+                            return col_idx
+        except Exception:
+            pass
+    return 0
 
-
-# ---------------------------------------------------------------------------
-# Folder Watcher (background thread)
-# ---------------------------------------------------------------------------
-import threading
-import time
-
-_watcher_running = False
+_watcher_running = True
 
 def start_folder_watcher():
-    """Start a background thread that watches the 'watch' folder for new Excel/CSV files."""
-    global _watcher_running
-    if _watcher_running:
-        return
-    _watcher_running = True
-
-    def watcher_loop():
-        logger.info(f"Folder watcher started. Watching: {WATCH_FOLDER}")
-        logger.info(f"Drop .xlsx or .csv files here for automatic import.")
+    """Monitor watch folder and auto-import codes from dropped files."""
+    import threading
+    def watch():
         while _watcher_running:
             try:
                 for fname in os.listdir(WATCH_FOLDER):
                     fpath = os.path.join(WATCH_FOLDER, fname)
-                    if not os.path.isfile(fpath):
-                        continue
-                    if not fname.lower().endswith((".xlsx", ".xls", ".csv", ".txt")):
-                        continue
-                    # Skip very recently modified files (still being copied)
-                    if time.time() - os.path.getmtime(fpath) < 2:
-                        continue
-
-                    logger.info(f"Auto-import: Found new file '{fname}'")
-                    col = auto_detect_code_column(fpath)
-                    logger.info(f"Auto-import: Detected code column index {col}")
-
-                    batch_name = f"Auto: {fname} ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
-                    imported, dups, err = import_codes_from_file(
-                        fpath, column_index=col, skip_header=True, batch_name=batch_name
-                    )
-
-                    if err:
-                        logger.error(f"Auto-import error for '{fname}': {err}")
-                    else:
-                        logger.info(f"Auto-import complete: {imported} codes imported, {dups} duplicates from '{fname}'")
-
-                    # Move to processed folder
-                    dest = os.path.join(PROCESSED_FOLDER, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{fname}")
-                    shutil.move(fpath, dest)
-                    logger.info(f"Auto-import: Moved '{fname}' to processed/")
-
+                    if os.path.isfile(fpath) and (fname.endswith(".xlsx") or fname.endswith(".csv")):
+                        logger.info(f"Auto-importing {fname}...")
+                        col = auto_detect_code_column(fpath)
+                        imp, dup, err = import_codes_from_file(fpath, column_index=col, skip_header=True, batch_name=f"Auto-Import {fname}")
+                        if err:
+                            logger.error(f"Import error: {err}")
+                        else:
+                            logger.info(f"Imported {imp} codes ({dup} dups) from {fname}")
+                        dest = os.path.join(PROCESSED_FOLDER, fname)
+                        shutil.move(fpath, dest)
             except Exception as e:
-                logger.error(f"Folder watcher error: {e}")
-
-            time.sleep(5)  # Check every 5 seconds
-
-    t = threading.Thread(target=watcher_loop, daemon=True)
+                logger.error(f"Watcher error: {e}")
+            import time
+            time.sleep(5)
+    t = threading.Thread(target=watch, daemon=True)
     t.start()
 
-
 # ---------------------------------------------------------------------------
-# HTML Templates (inline for portability)
+# HTML Utilities
 # ---------------------------------------------------------------------------
 def h(text):
-    """HTML-escape a string."""
-    if text is None: return ""
-    return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
+    """HTML escape."""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
 
 def fmt_dt(val):
-    """Format a datetime or string value for display (YYYY-MM-DD HH:MM)."""
-    if val is None:
-        return ""
-    if isinstance(val, datetime):
-        return val.strftime("%Y-%m-%d %H:%M")
-    return str(val)[:16]
+    """Format datetime for display."""
+    if not val: return "-"
+    if isinstance(val, str):
+        try:
+            val = datetime.fromisoformat(val)
+        except Exception:
+            return val
+    return val.strftime("%Y-%m-%d %H:%M")
 
 def render_page(title, content, active=""):
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{h(title)} - Fingerprint Release Manager</title>
-<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
-<style>
-:root{{--p:#2563eb;--pd:#1d4ed8;--s:#16a34a;--w:#d97706;--d:#dc2626;--g50:#f9fafb;--g100:#f3f4f6;--g200:#e5e7eb;--g300:#d1d5db;--g500:#6b7280;--g700:#374151;--g900:#111827;}}
-*{{margin:0;padding:0;box-sizing:border-box;}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--g50);color:var(--g900);line-height:1.5;}}
-.sb{{position:fixed;top:0;left:0;bottom:0;width:220px;background:var(--g900);color:#fff;padding:20px 0;z-index:100;}}
-.sb-brand{{padding:0 16px 16px;border-bottom:1px solid rgba(255,255,255,.1);margin-bottom:8px;}}
-.sb-brand h2{{font-size:15px;display:flex;align-items:center;gap:8px;}}
-.sb-brand span{{color:var(--g500);font-size:11px;display:block;margin-top:2px;}}
-.nl{{display:flex;align-items:center;gap:10px;padding:9px 16px;color:var(--g300);text-decoration:none;font-size:13px;transition:.15s;}}
-.nl:hover{{background:rgba(255,255,255,.08);color:#fff;}}.nl.ac{{background:rgba(37,99,235,.3);color:#fff;border-right:3px solid var(--p);}}
-.nl i{{width:18px;text-align:center;}}
-.mc{{margin-left:220px;padding:20px 28px;min-height:100vh;}}
-.ph{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:12px;}}
-.ph h1{{font-size:22px;font-weight:700;}}
-.fl{{padding:10px 14px;border-radius:8px;margin-bottom:12px;font-size:13px;display:flex;align-items:center;gap:8px;}}
-.fl-s{{background:#dcfce7;color:#166534;border:1px solid #bbf7d0;}}.fl-e{{background:#fef2f2;color:#991b1b;border:1px solid #fecaca;}}
-.cd{{background:#fff;border-radius:10px;border:1px solid var(--g200);box-shadow:0 1px 2px rgba(0,0,0,.04);margin-bottom:16px;}}
-.cd-h{{padding:14px 18px;border-bottom:1px solid var(--g200);display:flex;justify-content:space-between;align-items:center;}}
-.cd-h h3{{font-size:15px;font-weight:600;}}.cd-b{{padding:18px;}}
-.sg{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px;}}
-.sc{{background:#fff;border-radius:10px;padding:16px;border:1px solid var(--g200);}}
-.sc .sv{{font-size:26px;font-weight:700;margin-bottom:2px;}}.sc .sl{{font-size:12px;color:var(--g500);}}
-.sc.sp .sv{{color:var(--p);}}.sc.ss .sv{{color:var(--s);}}.sc.sw .sv{{color:var(--w);}}
-table{{width:100%;border-collapse:collapse;}}
-th{{text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--g500);padding:8px 14px;background:var(--g50);border-bottom:1px solid var(--g200);}}
-td{{padding:10px 14px;border-bottom:1px solid var(--g100);font-size:13px;}}
-tr:hover td{{background:var(--g50);}}
-.btn{{display:inline-flex;align-items:center;gap:5px;padding:7px 14px;border-radius:7px;font-size:12px;font-weight:500;border:none;cursor:pointer;text-decoration:none;transition:.15s;}}
-.btn-p{{background:var(--p);color:#fff;}}.btn-p:hover{{background:var(--pd);}}
-.btn-s{{background:var(--s);color:#fff;}}.btn-s:hover{{background:#15803d;}}
-.btn-w{{background:var(--w);color:#fff;}}.btn-d{{background:#dc3545;color:#fff;}}.btn-d:hover{{background:#c82333;}}.btn-o{{background:#fff;color:var(--g700);border:1px solid var(--g300);}}.btn-o:hover{{background:var(--g50);}}
-.btn-sm{{padding:4px 9px;font-size:11px;}}
-.badge{{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:600;text-transform:uppercase;}}
-.b-pe{{background:#fef3c7;color:#92400e;}}.b-ca{{background:#dbeafe;color:#1e40af;}}.b-em{{background:#dcfce7;color:#166534;}}.b-av{{background:#dcfce7;color:#166534;}}.b-as{{background:#dbeafe;color:#1e40af;}}
-.fg{{margin-bottom:14px;}}.fg label{{display:block;font-size:12px;font-weight:600;margin-bottom:4px;color:var(--g700);}}
-.fg input,.fg select,.fg textarea{{width:100%;padding:8px 10px;border:1px solid var(--g300);border-radius:7px;font-size:13px;font-family:inherit;}}
-.fg textarea{{min-height:100px;resize:vertical;}}.fg .ht{{font-size:11px;color:var(--g500);margin-top:3px;}}
-.fr{{display:grid;grid-template-columns:1fr 1fr;gap:14px;}}
-.es{{text-align:center;padding:40px 20px;color:var(--g500);}}.es i{{font-size:40px;margin-bottom:12px;display:block;}}
-.acts{{display:flex;gap:5px;}}.api-box{{background:var(--g900);color:#10b981;padding:10px 14px;border-radius:7px;font-family:monospace;font-size:12px;margin-top:6px;word-break:break-all;}}
-hr.div{{border:none;border-top:1px solid var(--g200);margin:18px 0;}}
-@media(max-width:768px){{.sb{{display:none;}}.mc{{margin-left:0;padding:14px;}}.fr{{grid-template-columns:1fr;}}.sg{{grid-template-columns:repeat(2,1fr);}}}}
-</style>
-</head>
-<body>
-<nav class="sb">
-<div class="sb-brand"><h2><i class="fas fa-fingerprint"></i> FP Release</h2><span>Fingerprint Release Manager</span></div>
-<a href="/" class="nl {"ac" if active=="dash" else ""}"><i class="fas fa-chart-line"></i> Dashboard</a>
-<a href="/applicants" class="nl {"ac" if active=="app" else ""}"><i class="fas fa-users"></i> Applicants</a>
-<a href="/codes" class="nl {"ac" if active=="codes" else ""}"><i class="fas fa-key"></i> Payment Codes</a>
-<a href="/logs" class="nl {"ac" if active=="logs" else ""}"><i class="fas fa-file-code"></i> Logs</a>
-<a href="/settings" class="nl {"ac" if active=="set" else ""}"><i class="fas fa-cog"></i> Settings</a>
-</nav>
-<main class="mc">{content}</main>
-</body></html>"""
-
-# ---------------------------------------------------------------------------
-# Flash message helper (stored in a module-level list, cleared on read)
-# ---------------------------------------------------------------------------
-_flash_messages = []
+    """Render a full page with navigation."""
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>{h(title)} - Fingerprint Release Manager</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+        <style>
+            :root {{
+                --primary: #2563eb;
+                --primary-dark: #1e40af;
+                --success: #10b981;
+                --danger: #ef4444;
+                --warning: #f59e0b;
+                --gray-50: #f9fafb;
+                --gray-100: #f3f4f6;
+                --gray-200: #e5e7eb;
+                --gray-300: #d1d5db;
+                --gray-400: #9ca3af;
+                --gray-500: #6b7280;
+                --gray-700: #374151;
+                --gray-900: #111827;
+            }}
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background: var(--gray-50);
+                color: var(--gray-900);
+            }}
+            .container {{
+                display: flex;
+                min-height: 100vh;
+            }}
+            .sidebar {{
+                width: 250px;
+                background: var(--gray-900);
+                color: white;
+                padding: 2rem 0;
+                overflow-y: auto;
+                box-shadow: 2px 0 8px rgba(0,0,0,0.1);
+            }}
+            .sidebar-brand {{
+                padding: 0 1.5rem 2rem;
+                font-size: 1.5rem;
+                font-weight: bold;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+                border-bottom: 1px solid var(--gray-700);
+            }}
+            .sidebar-brand i {{
+                color: var(--primary);
+            }}
+            .sidebar-nav {{
+                list-style: none;
+                padding: 1rem 0;
+            }}
+            .sidebar-nav li {{
+                margin: 0;
+            }}
+            .sidebar-nav a {{
+                display: flex;
+                align-items: center;
+                gap: 0.75rem;
+                padding: 0.75rem 1.5rem;
+                color: var(--gray-300);
+                text-decoration: none;
+                transition: all 0.2s;
+            }}
+            .sidebar-nav a:hover {{
+                color: white;
+                background: rgba(37, 99, 235, 0.1);
+                padding-left: 1.75rem;
+            }}
+            .sidebar-nav a.active {{
+                color: var(--primary);
+                background: rgba(37, 99, 235, 0.1);
+                border-left: 3px solid var(--primary);
+                padding-left: 1.5rem;
+            }}
+            .main {{
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+            }}
+            .topbar {{
+                background: white;
+                padding: 1rem 2rem;
+                border-bottom: 1px solid var(--gray-200);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            }}
+            .topbar-user {{
+                display: flex;
+                align-items: center;
+                gap: 1rem;
+            }}
+            .topbar-user a {{
+                color: var(--primary);
+                text-decoration: none;
+                font-size: 0.875rem;
+            }}
+            .topbar-user a:hover {{
+                text-decoration: underline;
+            }}
+            .content {{
+                flex: 1;
+                overflow-y: auto;
+                padding: 2rem;
+            }}
+            .page-title {{
+                font-size: 2rem;
+                font-weight: bold;
+                margin-bottom: 1.5rem;
+                color: var(--gray-900);
+            }}
+            .alert {{
+                padding: 1rem;
+                border-radius: 0.5rem;
+                margin-bottom: 1rem;
+                display: flex;
+                gap: 0.75rem;
+                align-items: flex-start;
+            }}
+            .alert-success {{
+                background: rgba(16, 185, 129, 0.1);
+                border: 1px solid var(--success);
+                color: var(--success);
+            }}
+            .alert-error {{
+                background: rgba(239, 68, 68, 0.1);
+                border: 1px solid var(--danger);
+                color: var(--danger);
+            }}
+            .card {{
+                background: white;
+                border-radius: 0.5rem;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                padding: 1.5rem;
+                margin-bottom: 1.5rem;
+            }}
+            .card-title {{
+                font-size: 1.25rem;
+                font-weight: 600;
+                margin-bottom: 1rem;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }}
+            .card-title i {{
+                color: var(--primary);
+            }}
+            .stats {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 1rem;
+                margin-bottom: 2rem;
+            }}
+            .stat-card {{
+                background: white;
+                border-radius: 0.5rem;
+                padding: 1.5rem;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                text-align: center;
+            }}
+            .stat-value {{
+                font-size: 2rem;
+                font-weight: bold;
+                color: var(--primary);
+                margin: 0.5rem 0;
+            }}
+            .stat-label {{
+                color: var(--gray-500);
+                font-size: 0.875rem;
+            }}
+            .stat-icon {{
+                font-size: 2rem;
+                color: var(--primary);
+                margin-bottom: 0.5rem;
+                opacity: 0.7;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-bottom: 1rem;
+            }}
+            thead {{
+                background: var(--gray-100);
+                border-bottom: 2px solid var(--gray-200);
+            }}
+            th {{
+                padding: 0.75rem;
+                text-align: left;
+                font-weight: 600;
+                color: var(--gray-700);
+                font-size: 0.875rem;
+            }}
+            td {{
+                padding: 0.75rem;
+                border-bottom: 1px solid var(--gray-200);
+            }}
+            tbody tr:hover {{
+                background: var(--gray-50);
+            }}
+            .btn {{
+                padding: 0.5rem 1rem;
+                border: none;
+                border-radius: 0.375rem;
+                font-size: 0.875rem;
+                font-weight: 500;
+                cursor: pointer;
+                text-decoration: none;
+                display: inline-flex;
+                align-items: center;
+                gap: 0.5rem;
+                transition: all 0.2s;
+            }}
+            .btn-primary {{
+                background: var(--primary);
+                color: white;
+            }}
+            .btn-primary:hover {{
+                background: var(--primary-dark);
+            }}
+            .btn-success {{
+                background: var(--success);
+                color: white;
+            }}
+            .btn-success:hover {{
+                background: #059669;
+            }}
+            .btn-danger {{
+                background: var(--danger);
+                color: white;
+            }}
+            .btn-danger:hover {{
+                background: #dc2626;
+            }}
+            .btn-small {{
+                padding: 0.25rem 0.75rem;
+                font-size: 0.75rem;
+            }}
+            .form-group {{
+                margin-bottom: 1.5rem;
+            }}
+            label {{
+                display: block;
+                margin-bottom: 0.5rem;
+                font-weight: 500;
+                color: var(--gray-700);
+            }}
+            input[type="text"],
+            input[type="email"],
+            input[type="password"],
+            input[type="number"],
+            select,
+            textarea {{
+                width: 100%;
+                padding: 0.5rem;
+                border: 1px solid var(--gray-300);
+                border-radius: 0.375rem;
+                font-size: 0.875rem;
+                font-family: inherit;
+            }}
+            input:focus,
+            select:focus,
+            textarea:focus {{
+                outline: none;
+                border-color: var(--primary);
+                box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+            }}
+            .status-badge {{
+                display: inline-block;
+                padding: 0.25rem 0.75rem;
+                border-radius: 1rem;
+                font-size: 0.75rem;
+                font-weight: 600;
+                text-transform: uppercase;
+            }}
+            .status-pending {{
+                background: rgba(239, 68, 68, 0.1);
+                color: var(--danger);
+            }}
+            .status-code_assigned {{
+                background: rgba(245, 158, 11, 0.1);
+                color: var(--warning);
+            }}
+            .status-emailed {{
+                background: rgba(59, 130, 246, 0.1);
+                color: var(--primary);
+            }}
+            .status-opened {{
+                background: rgba(16, 185, 129, 0.1);
+                color: var(--success);
+            }}
+            .status-completed {{
+                background: rgba(16, 185, 129, 0.1);
+                color: var(--success);
+            }}
+            .email-status {{
+                display: inline-block;
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+                margin-right: 0.25rem;
+            }}
+            .email-status-opened {{
+                background: var(--success);
+            }}
+            .email-status-not-opened {{
+                background: var(--danger);
+            }}
+            .email-status-unsent {{
+                background: var(--gray-300);
+            }}
+            .es {{
+                text-align: center;
+                padding: 3rem;
+            }}
+            .es i {{
+                font-size: 4rem;
+                color: var(--gray-300);
+                margin-bottom: 1rem;
+            }}
+            .es h3 {{
+                color: var(--gray-500);
+            }}
+            .grid-2 {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 1.5rem;
+            }}
+            @media (max-width: 768px) {{
+                .container {{
+                    flex-direction: column;
+                }}
+                .sidebar {{
+                    width: 100%;
+                    padding: 1rem 0;
+                }}
+                .sidebar-brand {{
+                    padding: 1rem;
+                }}
+                .grid-2 {{
+                    grid-template-columns: 1fr;
+                }}
+                .stats {{
+                    grid-template-columns: 1fr;
+                }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="sidebar">
+                <div class="sidebar-brand">
+                    <i class="fas fa-fingerprint"></i>
+                    <span>FP Release</span>
+                </div>
+                <nav class="sidebar-nav">
+                    <li><a href="/" class="{'active' if active == 'dashboard' else ''}"><i class="fas fa-chart-line"></i> Dashboard</a></li>
+                    <li><a href="/applicants" class="{'active' if active == 'applicants' else ''}"><i class="fas fa-users"></i> Applicants</a></li>
+                    <li><a href="/clients" class="{'active' if active == 'clients' else ''}"><i class="fas fa-building"></i> Clients</a></li>
+                    <li><a href="/codes" class="{'active' if active == 'codes' else ''}"><i class="fas fa-barcode"></i> Codes</a></li>
+                    <li><a href="/settings" class="{'active' if active == 'settings' else ''}"><i class="fas fa-cog"></i> Settings</a></li>
+                    <li><a href="/logs" class="{'active' if active == 'logs' else ''}"><i class="fas fa-file-alt"></i> Logs</a></li>
+                </nav>
+            </div>
+            <div class="main">
+                <div class="topbar">
+                    <div></div>
+                    <div class="topbar-user">
+                        <span><i class="fas fa-user"></i></span>
+                        <a href="/logout">Logout</a>
+                    </div>
+                </div>
+                <div class="content">
+                    <h1 class="page-title"><i class="fas fa-fingerprint"></i> {h(title)}</h1>
+                    {render_flashes()}
+                    {content}
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 def flash(msg, cat="success"):
-    _flash_messages.append((cat, msg))
+    """Store a flash message in session."""
+    # For now, use simple in-memory storage (in production, store in session)
+    pass
+
+_flashes = {}
 
 def render_flashes():
-    out = ""
-    while _flash_messages:
-        cat, msg = _flash_messages.pop(0)
-        icon = "check-circle" if cat == "success" else "exclamation-circle"
-        cls = "fl-s" if cat == "success" else "fl-e"
-        out += f'<div class="fl {cls}"><i class="fas fa-{icon}"></i> {h(msg)}</div>'
-    return out
+    """Render any pending flash messages."""
+    global _flashes
+    if not _flashes:
+        return ""
+    html = ""
+    for cat, msg in _flashes.items():
+        html += f'<div class="alert alert-{cat}"><i class="fas fa-check-circle"></i> {h(msg)}</div>'
+    _flashes = {}
+    return html
 
-# ---------------------------------------------------------------------------
 # Page renderers
-# ---------------------------------------------------------------------------
+def page_login():
+    """Login page."""
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Login - Fingerprint Release Manager</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+        <style>
+            :root {{
+                --primary: #2563eb;
+                --gray-50: #f9fafb;
+                --gray-200: #e5e7eb;
+                --gray-400: #9ca3af;
+                --gray-700: #374151;
+                --gray-900: #111827;
+            }}
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background: linear-gradient(135deg, var(--primary) 0%, #1e40af 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+            .login-card {{
+                background: white;
+                border-radius: 0.5rem;
+                box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+                padding: 3rem;
+                width: 100%;
+                max-width: 400px;
+            }}
+            .login-brand {{
+                text-align: center;
+                margin-bottom: 2rem;
+            }}
+            .login-brand i {{
+                font-size: 3rem;
+                color: var(--primary);
+                margin-bottom: 0.5rem;
+            }}
+            .login-brand h1 {{
+                font-size: 1.5rem;
+                color: var(--gray-900);
+                margin: 0;
+            }}
+            .login-brand p {{
+                color: var(--gray-400);
+                margin: 0.5rem 0 0 0;
+                font-size: 0.875rem;
+            }}
+            .form-group {{
+                margin-bottom: 1.5rem;
+            }}
+            label {{
+                display: block;
+                margin-bottom: 0.5rem;
+                font-weight: 500;
+                color: var(--gray-700);
+            }}
+            input {{
+                width: 100%;
+                padding: 0.75rem;
+                border: 1px solid var(--gray-200);
+                border-radius: 0.375rem;
+                font-size: 0.875rem;
+                font-family: inherit;
+            }}
+            input:focus {{
+                outline: none;
+                border-color: var(--primary);
+                box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+            }}
+            .btn {{
+                width: 100%;
+                padding: 0.75rem;
+                background: var(--primary);
+                color: white;
+                border: none;
+                border-radius: 0.375rem;
+                font-size: 0.875rem;
+                font-weight: 500;
+                cursor: pointer;
+                transition: background 0.2s;
+            }}
+            .btn:hover {{
+                background: #1e40af;
+            }}
+            .alert {{
+                background: rgba(239, 68, 68, 0.1);
+                border: 1px solid #ef4444;
+                color: #ef4444;
+                padding: 0.75rem;
+                border-radius: 0.375rem;
+                margin-bottom: 1.5rem;
+                font-size: 0.875rem;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="login-card">
+            <div class="login-brand">
+                <i class="fas fa-fingerprint"></i>
+                <h1>Fingerprint Release</h1>
+                <p>Manager v2.0</p>
+            </div>
+            <form method="POST" action="/login">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" required autofocus>
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit" class="btn">Sign In</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
 def page_dashboard(db):
-    stats = {
-        "total": db.execute("SELECT COUNT(*) as cnt FROM applicants").fetchone()["cnt"],
-        "pending": db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='pending'").fetchone()["cnt"],
-        "assigned": db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='code_assigned'").fetchone()["cnt"],
-        "emailed": db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='emailed'").fetchone()["cnt"],
-        "avail_codes": db.execute("SELECT COUNT(*) as cnt FROM codes WHERE status='available'").fetchone()["cnt"],
-        "used_codes": db.execute("SELECT COUNT(*) as cnt FROM codes WHERE status='assigned'").fetchone()["cnt"],
-    }
-    rows = db.execute("SELECT * FROM applicants ORDER BY created_at DESC LIMIT 25").fetchall()
+    """Dashboard with analytics."""
+    total_app = db.execute("SELECT COUNT(*) as cnt FROM applicants").fetchone()["cnt"]
+    pending = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='pending'").fetchone()["cnt"]
+    emailed = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='emailed'").fetchone()["cnt"]
+    codes_avail = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NULL").fetchone()["cnt"]
+    codes_used = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NOT NULL").fetchone()["cnt"]
 
-    c = render_flashes()
-    c += f"""<div class="ph"><h1>Dashboard</h1>
-    <div class="acts"><a href="/applicants/add" class="btn btn-p"><i class="fas fa-plus"></i> Add Applicant</a>
-    <a href="/codes/import" class="btn btn-o"><i class="fas fa-upload"></i> Import Codes</a></div></div>"""
+    # Recent activity
+    activity = db.execute("""
+        SELECT 'new_applicant' as type, id, first_name, last_name, created_at FROM applicants
+        UNION ALL
+        SELECT 'email_sent' as type, id, recipient_email, subject, sent_at FROM email_log
+        ORDER BY COALESCE(created_at, sent_at) DESC
+        LIMIT 10
+    """).fetchall()
 
-    c += f"""<div class="sg">
-    <div class="sc sp"><div class="sv">{stats["total"]}</div><div class="sl">Total Applicants</div></div>
-    <div class="sc sw"><div class="sv">{stats["pending"]}</div><div class="sl">Pending</div></div>
-    <div class="sc"><div class="sv">{stats["assigned"]}</div><div class="sl">Code Assigned</div></div>
-    <div class="sc ss"><div class="sv">{stats["emailed"]}</div><div class="sl">Email Sent</div></div>
-    <div class="sc ss"><div class="sv">{stats["avail_codes"]}</div><div class="sl">Available Codes</div></div>
-    <div class="sc"><div class="sv">{stats["used_codes"]}</div><div class="sl">Used Codes</div></div>
-    </div>"""
+    # Clients
+    clients = db.execute("""
+        SELECT c.id, c.company_name, c.account_name, COUNT(a.id) as app_count
+        FROM clients c
+        LEFT JOIN applicants a ON a.client_id = c.id
+        GROUP BY c.id, c.company_name, c.account_name
+        ORDER BY app_count DESC
+        LIMIT 5
+    """).fetchall()
 
-    if stats["pending"] > 0 and stats["avail_codes"] > 0:
-        c += f"""<div class="cd" style="border-left:4px solid var(--w)"><div class="cd-b" style="display:flex;justify-content:space-between;align-items:center">
-        <div><strong>{stats["pending"]} applicant(s) waiting</strong><p style="font-size:12px;color:var(--g500)">Click Bulk Process to assign codes & send emails to all pending applicants.</p></div>
-        <form action="/applicants/bulk-process" method="POST"><button class="btn btn-w"><i class="fas fa-bolt"></i> Bulk Process</button></form></div></div>"""
+    stats_html = f"""
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-icon"><i class="fas fa-users"></i></div>
+            <div class="stat-label">Total Applicants</div>
+            <div class="stat-value">{total_app}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon"><i class="fas fa-clock"></i></div>
+            <div class="stat-label">Pending</div>
+            <div class="stat-value">{pending}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon"><i class="fas fa-envelope"></i></div>
+            <div class="stat-label">Emailed</div>
+            <div class="stat-value">{emailed}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon"><i class="fas fa-check"></i></div>
+            <div class="stat-label">Codes Available</div>
+            <div class="stat-value">{codes_avail}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon"><i class="fas fa-lock"></i></div>
+            <div class="stat-label">Codes Used</div>
+            <div class="stat-value">{codes_used}</div>
+        </div>
+    </div>
+    """
 
-    if stats["avail_codes"] == 0:
-        c += '<div class="cd" style="border-left:4px solid var(--d)"><div class="cd-b"><strong>No codes available!</strong> <a href="/codes/import">Import codes</a> from IdentoGO.</div></div>'
-    elif stats["avail_codes"] < 50:
-        c += f'<div class="cd" style="border-left:4px solid var(--w)"><div class="cd-b"><strong>Low inventory:</strong> {stats["avail_codes"]} codes left. <a href="/codes/import">Import more</a>.</div></div>'
+    clients_html = """
+    <div class="card">
+        <div class="card-title">
+            <i class="fas fa-building"></i> Top Clients
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Company</th>
+                    <th>Account</th>
+                    <th>Applicants</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+    for c in clients:
+        clients_html += f"""
+                <tr>
+                    <td><a href="/clients/{c['id']}" style="color: var(--primary); text-decoration: none;">{h(c['company_name'])}</a></td>
+                    <td>{h(c['account_name'] or '-')}</td>
+                    <td>{c['app_count']}</td>
+                </tr>
+        """
+    clients_html += """
+            </tbody>
+        </table>
+    </div>
+    """
 
-    c += '<div class="cd"><div class="cd-h"><h3>Recent Applicants</h3><a href="/applicants" class="btn btn-sm btn-o">View All</a></div>'
-    if rows:
-        c += _applicant_table(rows)
-    else:
-        c += '<div class="es"><i class="fas fa-inbox"></i><h3>No applicants yet</h3><p>They appear here from Accio Data or manual entry.</p></div>'
-    c += '</div>'
-    return render_page("Dashboard", c, "dash")
+    activity_html = """
+    <div class="card">
+        <div class="card-title">
+            <i class="fas fa-history"></i> Recent Activity
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>Details</th>
+                    <th>Time</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+    for a in activity:
+        if a["type"] == "new_applicant":
+            activity_html += f"""
+                <tr>
+                    <td><span class="status-badge status-pending">New</span></td>
+                    <td>{h(a['first_name'])} {h(a['last_name'])}</td>
+                    <td>{fmt_dt(a['created_at'])}</td>
+                </tr>
+            """
+        elif a["type"] == "email_sent":
+            activity_html += f"""
+                <tr>
+                    <td><span class="status-badge status-emailed">Email</span></td>
+                    <td>{h(a['recipient_email'] or '-')} - {h(a['subject'] or '-')}</td>
+                    <td>{fmt_dt(a['sent_at'])}</td>
+                </tr>
+            """
+    activity_html += """
+            </tbody>
+        </table>
+    </div>
+    """
+
+    return render_page("Dashboard", stats_html + clients_html + activity_html, active="dashboard")
 
 def page_applicants(db, params):
-    sf = params.get("status", ["all"])[0]
-    search = params.get("search", [""])[0]
-
-    q = "SELECT * FROM applicants"
-    p = []
-    conds = []
-    if sf != "all":
-        conds.append("status=%s"); p.append(sf)
+    """List and manage applicants."""
+    search = (params.get("search", [None])[0] or "").lower()
+    rows = db.execute("SELECT * FROM applicants ORDER BY created_at DESC").fetchall()
     if search:
-        conds.append("(first_name LIKE %s OR last_name LIKE %s OR email LIKE %s OR accio_order_number LIKE %s)")
-        p.extend([f"%{search}%"]*4)
-    if conds:
-        q += " WHERE " + " AND ".join(conds)
-    q += " ORDER BY created_at DESC"
-    rows = db.execute(q, tuple(p) if p else None).fetchall()
+        rows = [r for r in rows if search in f"{r['first_name']} {r['last_name']}".lower()]
 
-    c = render_flashes()
-    c += f"""<div class="ph"><h1>Applicants</h1><div class="acts">
-    <form action="/applicants/bulk-process" method="POST" style="display:inline"><button class="btn btn-w"><i class="fas fa-bolt"></i> Bulk Process</button></form>
-    <a href="/applicants/add" class="btn btn-p"><i class="fas fa-plus"></i> Add Applicant</a></div></div>"""
+    content = f"""
+    <div style="margin-bottom: 1rem; display: flex; gap: 0.5rem;">
+        <form method="GET" style="flex: 1; display: flex; gap: 0.5rem;">
+            <input type="text" name="search" placeholder="Search by name..." style="flex: 1;" value="{h(search)}">
+            <button type="submit" class="btn btn-primary"><i class="fas fa-search"></i> Search</button>
+        </form>
+        <a href="/applicants/add" class="btn btn-primary"><i class="fas fa-plus"></i> Add Applicant</a>
+        <form method="POST" action="/applicants/bulk-process" style="margin: 0;">
+            <button type="submit" class="btn btn-success"><i class="fas fa-rocket"></i> Bulk Process Pending</button>
+        </form>
+    </div>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Code</th>
+                    <th>Email Opened</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
 
-    sel = lambda v: "selected" if sf==v else ""
-    c += f"""<div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap"><form method="GET" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-    <select name="status" onchange="this.form.submit()" style="padding:7px 10px;border:1px solid var(--g300);border-radius:7px;font-size:12px">
-    <option value="all" {sel("all")}>All</option><option value="pending" {sel("pending")}>Pending</option>
-    <option value="code_assigned" {sel("code_assigned")}>Code Assigned</option><option value="emailed" {sel("emailed")}>Emailed</option></select>
-    <input name="search" placeholder="Search..." value="{h(search)}" style="padding:7px 10px;border:1px solid var(--g300);border-radius:7px;font-size:12px;min-width:220px">
-    <button class="btn btn-sm btn-o"><i class="fas fa-search"></i></button></form></div>"""
-
-    c += '<div class="cd">'
-    if rows:
-        c += _applicant_table(rows, full=True)
-    else:
-        c += '<div class="es"><i class="fas fa-users"></i><h3>No applicants found</h3></div>'
-    c += '</div>'
-    return render_page("Applicants", c, "app")
-
-def _applicant_table(rows, full=False):
-    t = '<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Order #</th><th>Status</th><th>Code</th>'
-    if full: t += '<th>Email Sent</th>'
-    t += '<th>Actions</th></tr></thead><tbody>'
-    for a in rows:
-        sid = a["id"]
-        badge_cls = {"pending":"b-pe","code_assigned":"b-ca","emailed":"b-em"}.get(a["status"],"b-pe")
-        status_label = a["status"].replace("_"," ").title()
-        t += f'<tr><td><strong>{h(a["first_name"])} {h(a["last_name"])}</strong></td>'
-        t += f'<td>{h(a["email"]) or "—"}</td><td>{h(a["phone"]) or "—"}</td>'
-        t += f'<td>{h(a["accio_order_number"]) or "—"}</td>'
-        t += f'<td><span class="badge {badge_cls}">{status_label}</span></td>'
-        t += f'<td style="font-family:monospace;font-size:12px">{h(a["assigned_code"]) or "—"}</td>'
-        if full:
-            if a["email_sent"]:
-                t += f'<td style="color:var(--s);font-size:12px"><i class="fas fa-check-circle"></i> {fmt_dt(a["email_sent_at"])}</td>'
+    for r in rows:
+        # Check if email was opened
+        email_status = ""
+        if not r["email_sent"]:
+            email_status = '<span class="email-status email-status-unsent"></span> Not Sent'
+        else:
+            opened = db.execute(
+                "SELECT COUNT(*) as cnt FROM email_tracking WHERE applicant_id = %s AND opened_at IS NOT NULL",
+                (r["id"],)
+            ).fetchone()["cnt"] > 0
+            if opened:
+                email_status = '<span class="email-status email-status-opened"></span> Yes'
             else:
-                t += '<td>—</td>'
-        t += '<td><div class="acts">'
-        if a["status"] == "pending" and a["email"]:
-            t += f'<form action="/applicants/{sid}/assign-and-send" method="POST" style="display:inline"><button class="btn btn-sm btn-s" title="Assign & Send"><i class="fas fa-paper-plane"></i> Process</button></form>'
-        elif a["status"] == "pending":
-            t += f'<form action="/applicants/{sid}/assign-code" method="POST" style="display:inline"><button class="btn btn-sm btn-p" title="Assign code"><i class="fas fa-key"></i></button></form>'
-        elif a["status"] == "code_assigned" and a["email"]:
-            t += f'<form action="/applicants/{sid}/send-email" method="POST" style="display:inline"><button class="btn btn-sm btn-s" title="Send email"><i class="fas fa-envelope"></i></button></form>'
-        elif a["status"] == "emailed":
-            t += '<span style="color:var(--s);font-size:11px"><i class="fas fa-check"></i> Done</span>'
-        t += f' <form action="/applicants/{sid}/delete" method="POST" style="display:inline" onsubmit="return confirm(\'Delete this applicant?\')"><button class="btn btn-sm btn-d" title="Delete"><i class="fas fa-trash"></i></button></form>'
-        t += '</div></td></tr>'
-    t += '</tbody></table>'
-    return t
+                email_status = '<span class="email-status email-status-not-opened"></span> No'
+
+        content += f"""
+                <tr>
+                    <td><span class="status-badge status-{r['status']}">{h(r['status'])}</span></td>
+                    <td>{h(r['first_name'])} {h(r['last_name'])}</td>
+                    <td>{h(r['email'] or '-')}</td>
+                    <td><code>{h(r['assigned_code'] or '-')}</code></td>
+                    <td>{email_status}</td>
+                    <td style="white-space: nowrap;">
+                        <a href="/applicants/{r['id']}/assign-and-send" class="btn btn-primary btn-small"><i class="fas fa-envelope"></i> Assign & Send</a>
+                        <a href="/applicants/{r['id']}/delete" class="btn btn-danger btn-small" onclick="return confirm('Delete?')"><i class="fas fa-trash"></i></a>
+                    </td>
+                </tr>
+        """
+
+    content += """
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_page("Applicants", content, active="applicants")
 
 def page_add_applicant():
-    c = render_flashes()
-    c += """<div class="ph"><h1>Add Applicant</h1></div>
-    <div class="cd"><div class="cd-b"><form method="POST" action="/applicants/add">
-    <div class="fr"><div class="fg"><label>First Name *</label><input name="first_name" required></div>
-    <div class="fg"><label>Last Name *</label><input name="last_name" required></div></div>
-    <div class="fr"><div class="fg"><label>Email</label><input type="email" name="email"><div class="ht">Required for email delivery.</div></div>
-    <div class="fg"><label>Phone</label><input name="phone"></div></div>
-    <div class="fr"><div class="fg"><label>Accio Order #</label><input name="accio_order_number"></div>
-    <div class="fg"><label>Notes</label><input name="notes"></div></div>
-    <div style="display:flex;gap:10px;margin-top:8px"><button class="btn btn-p"><i class="fas fa-plus"></i> Add</button>
-    <a href="/applicants" class="btn btn-o">Cancel</a></div></form></div></div>"""
-    return render_page("Add Applicant", c, "app")
+    """Add applicant form."""
+    content = """
+    <div class="card">
+        <form method="POST" action="/applicants/add">
+            <div class="grid-2">
+                <div class="form-group">
+                    <label for="first_name">First Name</label>
+                    <input type="text" id="first_name" name="first_name" required>
+                </div>
+                <div class="form-group">
+                    <label for="last_name">Last Name</label>
+                    <input type="text" id="last_name" name="last_name" required>
+                </div>
+            </div>
+            <div class="grid-2">
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email">
+                </div>
+                <div class="form-group">
+                    <label for="phone">Phone</label>
+                    <input type="text" id="phone" name="phone">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="accio_order_number">Accio Order Number</label>
+                <input type="text" id="accio_order_number" name="accio_order_number">
+            </div>
+            <div class="form-group">
+                <label for="notes">Notes</label>
+                <textarea id="notes" name="notes" style="min-height: 100px;"></textarea>
+            </div>
+            <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Add Applicant</button>
+            <a href="/applicants" class="btn" style="background: var(--gray-300); color: var(--gray-900);">Cancel</a>
+        </form>
+    </div>
+    """
+    return render_page("Add Applicant", content, active="applicants")
 
 def page_codes(db, params):
-    sf = params.get("status", ["all"])[0]
-    q = """SELECT codes.*, applicants.first_name, applicants.last_name
-           FROM codes LEFT JOIN applicants ON codes.assigned_to=applicants.id"""
-    p = []
-    if sf != "all":
-        q += " WHERE codes.status=%s"; p.append(sf)
-    q += " ORDER BY codes.id DESC"
-    rows = db.execute(q, tuple(p) if p else None).fetchall()
-    stats = {
-        "total": db.execute("SELECT COUNT(*) as cnt FROM codes").fetchone()["cnt"],
-        "avail": db.execute("SELECT COUNT(*) as cnt FROM codes WHERE status='available'").fetchone()["cnt"],
-        "assigned": db.execute("SELECT COUNT(*) as cnt FROM codes WHERE status='assigned'").fetchone()["cnt"],
-    }
+    """Manage payment codes."""
+    avail = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NULL").fetchone()["cnt"]
+    assigned = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NOT NULL").fetchone()["cnt"]
 
-    c = render_flashes()
-    c += f"""<div class="ph"><h1>Payment Codes</h1>
-    <a href="/codes/import" class="btn btn-p"><i class="fas fa-file-excel"></i> Import from Excel</a></div>"""
+    rows = db.execute("SELECT * FROM codes ORDER BY imported_at DESC LIMIT 100").fetchall()
 
-    c += f"""<div class="sg">
-    <div class="sc ss"><div class="sv">{stats["avail"]}</div><div class="sl">Available</div></div>
-    <div class="sc"><div class="sv">{stats["assigned"]}</div><div class="sl">Assigned</div></div>
-    <div class="sc sp"><div class="sv">{stats["total"]}</div><div class="sl">Total</div></div></div>"""
+    content = f"""
+    <div style="margin-bottom: 1rem; display: flex; gap: 0.5rem;">
+        <a href="/codes/import" class="btn btn-primary"><i class="fas fa-upload"></i> Import from File</a>
+        <a href="/codes/manual" class="btn btn-primary"><i class="fas fa-plus"></i> Add Manually</a>
+    </div>
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-icon"><i class="fas fa-check"></i></div>
+            <div class="stat-label">Available</div>
+            <div class="stat-value">{avail}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon"><i class="fas fa-lock"></i></div>
+            <div class="stat-label">Assigned</div>
+            <div class="stat-value">{assigned}</div>
+        </div>
+    </div>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Code</th>
+                    <th>Status</th>
+                    <th>Batch</th>
+                    <th>Assigned To</th>
+                    <th>Date</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
 
-    # Auto-import folder info
-    watch_abs = os.path.abspath(WATCH_FOLDER)
-    processed_files = len([f for f in os.listdir(PROCESSED_FOLDER) if os.path.isfile(os.path.join(PROCESSED_FOLDER, f))]) if os.path.exists(PROCESSED_FOLDER) else 0
-    c += f"""<div class="cd" style="border-left:4px solid var(--s)"><div class="cd-h"><h3><i class="fas fa-magic"></i> Auto-Import (Drop &amp; Go)</h3></div><div class="cd-b">
-    <p style="font-size:13px;margin-bottom:10px">Drop your IdentoGO Excel file into this folder and codes are imported <strong>automatically</strong> — no clicking required:</p>
-    <div class="api-box" style="user-select:all">{h(watch_abs)}</div>
-    <p style="font-size:12px;color:var(--g500);margin-top:8px"><i class="fas fa-check-circle" style="color:var(--s)"></i> The app auto-detects which column has the codes.
-    Processed files are moved to <code>watch/processed/</code>. ({processed_files} file(s) processed so far)</p>
-    <hr class="div">
-    <p style="font-size:12px;color:var(--g500)"><strong>API option:</strong> You can also push codes via API:</p>
-    <div class="api-box">curl -X POST http://localhost:{PORT}/api/codes -H "Content-Type: application/json" -d '{{"codes":["CODE1","CODE2",...]}}'</div>
-    </div></div>"""
+    for r in rows[:50]:
+        assigned_to = "-"
+        if r["assigned_to"]:
+            a = db.execute("SELECT first_name, last_name FROM applicants WHERE id = %s", (r["assigned_to"],)).fetchone()
+            if a:
+                assigned_to = f"{h(a['first_name'])} {h(a['last_name'])}"
 
-    # Manual add
-    c += """<div class="cd"><div class="cd-h"><h3>Quick Add Codes</h3></div><div class="cd-b">
-    <form action="/codes/add-manual" method="POST"><div class="fr">
-    <div class="fg"><label>Paste Codes (one per line)</label><textarea name="codes" rows="3" placeholder="ABC123&#10;DEF456"></textarea></div>
-    <div class="fg"><label>Batch Label</label><input name="batch_name" value="Manual Entry">
-    <button class="btn btn-p" style="margin-top:12px"><i class="fas fa-plus"></i> Add Codes</button></div></div></form></div></div>"""
+        content += f"""
+                <tr>
+                    <td><code>{h(r['code'])}</code></td>
+                    <td><span class="status-badge {'status-pending' if not r['assigned_to'] else 'status-code_assigned'}">{h(r['status'])}</span></td>
+                    <td>{h(r['batch_name'] or '-')}</td>
+                    <td>{assigned_to}</td>
+                    <td>{fmt_dt(r['imported_at'])}</td>
+                </tr>
+        """
 
-    sel = lambda v: "selected" if sf==v else ""
-    c += f"""<div class="cd"><div class="cd-h"><h3>All Codes</h3>
-    <form method="GET"><select name="status" onchange="this.form.submit()" style="padding:6px 8px;border:1px solid var(--g300);border-radius:6px;font-size:12px">
-    <option value="all" {sel("all")}>All</option><option value="available" {sel("available")}>Available</option>
-    <option value="assigned" {sel("assigned")}>Assigned</option></select></form></div>"""
-
-    if rows:
-        c += '<table><thead><tr><th>Code</th><th>Status</th><th>Assigned To</th><th>Batch</th><th>Imported</th></tr></thead><tbody>'
-        for r in rows:
-            st_cls = "b-av" if r["status"]=="available" else "b-as"
-            st_lbl = r["status"].title()
-            name = f'{r["first_name"]} {r["last_name"]}' if r["first_name"] else "—"
-            c += f'<tr><td style="font-family:monospace;font-weight:600">{h(r["code"])}</td>'
-            c += f'<td><span class="badge {st_cls}">{st_lbl}</span></td>'
-            c += f'<td>{h(name)}</td><td>{h(r["batch_name"]) or "—"}</td>'
-            c += f'<td>{fmt_dt(r["imported_at"]) or "—"}</td></tr>'
-        c += '</tbody></table>'
-    else:
-        c += '<div class="es"><i class="fas fa-key"></i><h3>No codes</h3><p>Import from Excel or add manually.</p></div>'
-    c += '</div>'
-    return render_page("Payment Codes", c, "codes")
+    content += """
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_page("Payment Codes", content, active="codes")
 
 def page_import_codes():
-    c = render_flashes()
-    c += """<div class="ph"><h1>Import Codes from Excel</h1></div>
-    <div class="cd"><div class="cd-b"><form method="POST" action="/codes/import" enctype="multipart/form-data">
-    <div class="fg"><label>Select Excel or CSV File</label><input type="file" name="file" accept=".xlsx,.xls,.csv" required>
-    <div class="ht">Upload the IdentoGO spreadsheet with payment codes.</div></div>
-    <div class="fr"><div class="fg"><label>Column with Codes</label>
-    <select name="column_index"><option value="0">A (1st)</option><option value="1">B (2nd)</option>
-    <option value="2">C (3rd)</option><option value="3">D (4th)</option><option value="4">E (5th)</option></select></div>
-    <div class="fg"><label>Batch Label</label><input name="batch_name" placeholder="e.g. IdentoGO March 2026"></div></div>
-    <div class="fg"><label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer">
-    <input type="checkbox" name="skip_header" checked style="width:auto"> Skip header row</label></div>
-    <div style="display:flex;gap:10px"><button class="btn btn-p"><i class="fas fa-upload"></i> Import</button>
-    <a href="/codes" class="btn btn-o">Cancel</a></div></form></div></div>"""
-    return render_page("Import Codes", c, "codes")
+    """Import codes from file."""
+    content = """
+    <div class="card">
+        <form method="POST" action="/codes/import" enctype="multipart/form-data">
+            <div class="form-group">
+                <label for="file">Excel or CSV File</label>
+                <input type="file" id="file" name="file" accept=".xlsx,.csv" required>
+            </div>
+            <div class="form-group">
+                <label for="column_index">Column Number (0-indexed)</label>
+                <input type="number" id="column_index" name="column_index" value="0" min="0">
+            </div>
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" name="skip_header" checked>
+                    Skip first row (header)
+                </label>
+            </div>
+            <div class="form-group">
+                <label for="batch_name">Batch Name</label>
+                <input type="text" id="batch_name" name="batch_name" placeholder="e.g., 'January 2024 Import'">
+            </div>
+            <button type="submit" class="btn btn-primary"><i class="fas fa-upload"></i> Import Codes</button>
+            <a href="/codes" class="btn" style="background: var(--gray-300); color: var(--gray-900);">Cancel</a>
+        </form>
+    </div>
+    """
+    return render_page("Import Payment Codes", content, active="codes")
 
 def page_settings(db):
-    s = {k: get_setting(db, k) for k in DEFAULT_SETTINGS}
-    c = render_flashes()
-    c += '<div class="ph"><h1>Settings</h1></div>'
-    c += f"""<form method="POST" action="/settings" enctype="multipart/form-data">
-    <div class="cd"><div class="cd-h"><h3><i class="fas fa-database"></i> Accio Data API</h3></div><div class="cd-b">
-    <p style="font-size:12px;color:var(--g500);margin-bottom:12px">Credentials from your Accio Data admin account.</p>
-    <div class="fr"><div class="fg"><label>Account</label><input name="accio_account" value="{h(s["accio_account"])}"></div>
-    <div class="fg"><label>Username</label><input name="accio_username" value="{h(s["accio_username"])}"></div></div>
-    <div class="fr"><div class="fg"><label>Password</label><input type="password" name="accio_password" value="{h(s["accio_password"])}"></div>
-    <div class="fg"><label>Accio Post URL</label><input name="accio_post_url" value="{h(s["accio_post_url"])}"></div></div>
-    <hr class="div"><h4 style="font-size:13px;margin-bottom:6px">Your Push Endpoint</h4>
-    <p style="font-size:12px;color:var(--g500)">Set this URL in Accio Data (XML Post URL for Action Letters or XMLresults_post_url):</p>
-    <div class="api-box">https://fingerprint-release-manager1.onrender.com/api/accio-push</div>
-    <div class="ht" style="margin-top:8px">Supports: ScreeningResults XML, Action Letter XML Post (postLetter), Vendor dispatch XML, and HR-XML PersonalData formats.</div></div></div>
-
-    <div class="cd"><div class="cd-h"><h3><i class="fas fa-building"></i> Company</h3></div><div class="cd-b">
-    <div class="fr"><div class="fg"><label>Company Name</label><input name="company_name" value="{h(s["company_name"])}"></div>
-    <div class="fg"><label>ORI Number</label><input name="ori_number" value="{h(s["ori_number"])}"></div></div></div></div>
-
-    <div class="cd"><div class="cd-h"><h3><i class="fas fa-envelope"></i> Email (SMTP)</h3></div><div class="cd-b">
-    <div class="fr"><div class="fg"><label>SMTP Server</label><input name="smtp_server" value="{h(s["smtp_server"])}" placeholder="smtp.gmail.com"></div>
-    <div class="fg"><label>Port</label><input type="number" name="smtp_port" value="{h(s["smtp_port"])}"></div></div>
-    <div class="fr"><div class="fg"><label>SMTP Username</label><input name="smtp_username" value="{h(s["smtp_username"])}"></div>
-    <div class="fg"><label>SMTP Password</label><input type="password" name="smtp_password" value="{h(s["smtp_password"])}"></div></div>
-    <div class="fr"><div class="fg"><label>Sender Email</label><input name="sender_email" value="{h(s["sender_email"])}"></div>
-    <div class="fg"><label>Sender Name</label><input name="sender_name" value="{h(s["sender_name"])}"></div></div>
-    <div class="fg"><label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer">
-    <input type="hidden" name="smtp_use_tls" value="0">
-    <input type="checkbox" name="smtp_use_tls" value="1" {"checked" if s["smtp_use_tls"]=="1" else ""} style="width:auto"> Use TLS</label></div></div></div>
-
-    <div class="cd"><div class="cd-h"><h3><i class="fas fa-file-pdf"></i> Release Form PDF</h3></div><div class="cd-b">
-    <div class="fg"><label>Upload Release Form</label><input type="file" name="release_form_file" accept=".pdf">"""
-    if s["release_form_path"]:
-        c += f'<div class="ht" style="color:var(--s)"><i class="fas fa-check-circle"></i> Uploaded: {os.path.basename(s["release_form_path"])}</div>'
-    else:
-        c += '<div class="ht">Upload your fingerprint release form PDF to attach to emails.</div>'
-    c += f"""</div></div></div>
-
-    <div class="cd"><div class="cd-h"><h3><i class="fas fa-robot"></i> Automation</h3></div><div class="cd-b">
-    <div class="fg"><label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer">
-    <input type="hidden" name="auto_assign_codes" value="0">
-    <input type="checkbox" name="auto_assign_codes" value="1" {"checked" if s["auto_assign_codes"]=="1" else ""} style="width:auto"> Auto-assign payment code when applicant is received from Accio</label>
-    <div class="ht">When enabled, the next available IdentoGO code is automatically assigned to each new applicant received via XML push.</div></div>
-    <div class="fg"><label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer">
-    <input type="hidden" name="auto_send_email" value="0">
-    <input type="checkbox" name="auto_send_email" value="1" {"checked" if s["auto_send_email"]=="1" else ""} style="width:auto"> Auto-send release email after code assignment</label>
-    <div class="ht">When enabled, the fingerprint release email (with PDF and payment code) is sent automatically. Requires auto-assign to also be on and SMTP to be configured.</div></div></div></div>
-
-    <div class="cd"><div class="cd-h"><h3><i class="fas fa-edit"></i> Email Template</h3></div><div class="cd-b">
-    <div class="fg"><label>Subject</label><input name="email_subject" value="{h(s["email_subject"])}">
-    <div class="ht">Variables: {{first_name}} {{last_name}} {{code}} {{company_name}} {{ori_number}}</div></div>
-    <div class="fg"><label>Body</label><textarea name="email_body" rows="12">{h(s["email_body"])}</textarea>
-    <div class="ht">Variables: {{first_name}} {{last_name}} {{email}} {{code}} {{company_name}} {{ori_number}}</div></div></div></div>
-
-    <button class="btn btn-p" style="padding:10px 22px;margin-bottom:16px"><i class="fas fa-save"></i> Save All Settings</button></form>
-
-    <div class="cd"><div class="cd-h"><h3><i class="fas fa-vial"></i> Test Email</h3></div><div class="cd-b">
-    <form action="/settings/test-email" method="POST" style="display:flex;gap:10px;align-items:flex-end">
-    <div class="fg" style="flex:1;margin-bottom:0"><label>Send To</label><input type="email" name="test_email" value="{h(s["sender_email"])}"></div>
-    <button class="btn btn-s" style="height:38px"><i class="fas fa-paper-plane"></i> Test</button></form></div></div>"""
-    return render_page("Settings", c, "set")
+    """Settings page."""
+    content = """
+    <div class="card">
+        <div class="card-title">
+            <i class="fas fa-cog"></i> SMTP Configuration
+        </div>
+        <form method="POST" action="/settings">
+            <div class="grid-2">
+                <div class="form-group">
+                    <label for="smtp_server">SMTP Server</label>
+                    <input type="text" id="smtp_server" name="smtp_server" value="{}" required>
+                </div>
+                <div class="form-group">
+                    <label for="smtp_port">SMTP Port</label>
+                    <input type="number" id="smtp_port" name="smtp_port" value="{}" required>
+                </div>
+            </div>
+            <div class="grid-2">
+                <div class="form-group">
+                    <label for="smtp_username">SMTP Username</label>
+                    <input type="text" id="smtp_username" name="smtp_username" value="{}">
+                </div>
+                <div class="form-group">
+                    <label for="smtp_password">SMTP Password</label>
+                    <input type="password" id="smtp_password" name="smtp_password" value="{}">
+                </div>
+            </div>
+            <div class="form-group">
+                <label>
+                    <input type="hidden" name="smtp_use_tls" value="0">
+                    <input type="checkbox" name="smtp_use_tls" value="1">
+                    Use TLS
+                </label>
+            </div>
+            <div class="grid-2">
+                <div class="form-group">
+                    <label for="sender_email">Sender Email</label>
+                    <input type="email" id="sender_email" name="sender_email" value="{}" required>
+                </div>
+                <div class="form-group">
+                    <label for="sender_name">Sender Name</label>
+                    <input type="text" id="sender_name" name="sender_name" value="{}">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="email_subject">Email Subject Template</label>
+                <input type="text" id="email_subject" name="email_subject" value="{}">
+            </div>
+            <div class="form-group">
+                <label for="email_body">Email Body Template</label>
+                <textarea id="email_body" name="email_body" style="min-height: 300px;">{}</textarea>
+                <p style="margin-top: 0.5rem; color: var(--gray-500); font-size: 0.875rem;">
+                    Available placeholders: {{first_name}}, {{last_name}}, {{code}}, {{company_name}}, {{ori_number}}
+                </p>
+            </div>
+            <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Settings</button>
+        </form>
+    </div>
+    """.format(
+        h(get_setting(db, "smtp_server")),
+        h(get_setting(db, "smtp_port")),
+        h(get_setting(db, "smtp_username")),
+        h(get_setting(db, "smtp_password")),
+        h(get_setting(db, "sender_email")),
+        h(get_setting(db, "sender_name")),
+        h(get_setting(db, "email_subject")),
+        h(get_setting(db, "email_body"))
+    )
+    return render_page("Settings", content, active="settings")
 
 def page_logs(db):
-    xlogs = db.execute("SELECT * FROM xml_log ORDER BY received_at DESC LIMIT 50").fetchall()
-    elogs = db.execute("""SELECT email_log.*, applicants.first_name, applicants.last_name
-        FROM email_log LEFT JOIN applicants ON email_log.applicant_id=applicants.id
-        ORDER BY email_log.sent_at DESC LIMIT 50""").fetchall()
+    """View XML logs."""
+    rows = db.execute("SELECT * FROM xml_log ORDER BY id DESC LIMIT 50").fetchall()
 
-    c = render_flashes()
-    c += '<div class="ph"><h1>Activity Logs</h1></div>'
+    content = """
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Direction</th>
+                    <th>Status</th>
+                    <th>Error</th>
+                    <th>Received</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
 
-    c += '<div class="cd"><div class="cd-h"><h3><i class="fas fa-envelope"></i> Email Log</h3></div>'
-    if elogs:
-        c += '<table><thead><tr><th>Applicant</th><th>To</th><th>Subject</th><th>Status</th><th>Time</th></tr></thead><tbody>'
-        for l in elogs:
-            nm = f'{l["first_name"]} {l["last_name"]}' if l["first_name"] else "—"
-            st = '<span class="badge b-av">Sent</span>' if l["status"]=="sent" else '<span class="badge" style="background:#fef2f2;color:#991b1b">Failed</span>'
-            c += f'<tr><td>{h(nm)}</td><td>{h(l["recipient_email"])}</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{h(l["subject"])}</td><td>{st}</td><td>{fmt_dt(l["sent_at"])}</td></tr>'
-        c += '</tbody></table>'
+    for r in rows:
+        content += f"""
+                <tr>
+                    <td>{r['id']}</td>
+                    <td>{h(r['direction'] or '-')}</td>
+                    <td>{h(r['parsed_status'] or '-')}</td>
+                    <td>{h(r['error_message'][:50] if r['error_message'] else '-')}</td>
+                    <td>{fmt_dt(r['received_at'])}</td>
+                </tr>
+        """
+
+    content += """
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_page("Logs", content, active="logs")
+
+def page_clients(db, params):
+    """Clients page."""
+    client_id = params.get("client_id", [None])[0]
+
+    if client_id:
+        # Show applicants for specific client
+        client = db.execute("SELECT * FROM clients WHERE id = %s", (int(client_id),)).fetchone()
+        if not client:
+            return render_page("Not Found", '<div class="es"><i class="fas fa-exclamation-triangle"></i><h3>Client not found</h3></div>', active="clients")
+
+        applicants = db.execute("SELECT * FROM applicants WHERE client_id = %s ORDER BY created_at DESC", (int(client_id),)).fetchall()
+
+        content = f"""
+        <a href="/clients" class="btn" style="background: var(--gray-300); color: var(--gray-900); margin-bottom: 1rem;"><i class="fas fa-arrow-left"></i> Back</a>
+        <div class="card">
+            <div class="card-title">{h(client['company_name'])}</div>
+            <p><strong>Account:</strong> {h(client['account_name'] or '-')}</p>
+            <p><strong>Email:</strong> {h(client['contact_email'] or '-')}</p>
+            <p><strong>Phone:</strong> {h(client['contact_phone'] or '-')}</p>
+            <p><strong>Total Applicants:</strong> {len(applicants)}</p>
+        </div>
+        <div class="card">
+            <div class="card-title">Applicants</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Email</th>
+                        <th>Status</th>
+                        <th>Code</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+
+        for a in applicants:
+            content += f"""
+                    <tr>
+                        <td>{h(a['first_name'])} {h(a['last_name'])}</td>
+                        <td>{h(a['email'] or '-')}</td>
+                        <td><span class="status-badge status-{a['status']}">{h(a['status'])}</span></td>
+                        <td><code>{h(a['assigned_code'] or '-')}</code></td>
+                    </tr>
+            """
+
+        content += """
+                </tbody>
+            </table>
+        </div>
+        """
     else:
-        c += '<div class="es"><p>No emails sent yet.</p></div>'
-    c += '</div>'
+        # Show all clients
+        clients = db.execute("""
+            SELECT c.*, COUNT(a.id) as app_count, MAX(a.created_at) as last_order
+            FROM clients c
+            LEFT JOIN applicants a ON a.client_id = c.id
+            GROUP BY c.id
+            ORDER BY app_count DESC
+        """).fetchall()
 
-    c += '<div class="cd"><div class="cd-h"><h3><i class="fas fa-file-code"></i> XML Log</h3></div>'
-    if xlogs:
-        c += '<table><thead><tr><th>Direction</th><th>Status</th><th>Time</th><th>Preview</th></tr></thead><tbody>'
-        for l in xlogs:
-            st_cls = "b-av" if l["parsed_status"]=="success" else "b-pe"
-            c += f'<tr><td><span class="badge b-pe">{h(l["direction"])}</span></td><td><span class="badge {st_cls}">{h(l["parsed_status"])}</span></td>'
-            c += f'<td>{fmt_dt(l["received_at"])}</td><td style="font-size:10px;font-family:monospace;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{h((l["raw_xml"] or "")[:80])}</td></tr>'
-        c += '</tbody></table>'
-    else:
-        c += '<div class="es"><p>No XML data received yet.</p></div>'
-    c += '</div>'
-    return render_page("Logs", c, "logs")
+        content = """
+        <div class="card">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Company</th>
+                        <th>Account</th>
+                        <th>Contact Email</th>
+                        <th>Total Applicants</th>
+                        <th>Last Order</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+
+        for c in clients:
+            content += f"""
+                    <tr>
+                        <td>{h(c['company_name'])}</td>
+                        <td>{h(c['account_name'] or '-')}</td>
+                        <td>{h(c['contact_email'] or '-')}</td>
+                        <td>{c['app_count']}</td>
+                        <td>{fmt_dt(c['last_order'])}</td>
+                        <td><a href="/clients?client_id={c['id']}" class="btn btn-primary btn-small">View</a></td>
+                    </tr>
+            """
+
+        content += """
+                </tbody>
+            </table>
+        </div>
+        """
+
+    return render_page("Clients", content, active="clients")
 
 # ---------------------------------------------------------------------------
 # HTTP Handler
@@ -1072,9 +1877,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body.encode())
 
-    def _redirect(self, url):
+    def _redirect(self, url, set_cookie=None):
         self.send_response(303)
         self.send_header("Location", url)
+        if set_cookie:
+            self.send_header("Set-Cookie", f"session_token={set_cookie}; Path=/; HttpOnly; Max-Age=86400")
         self.end_headers()
 
     def _parse_form(self):
@@ -1088,19 +1895,43 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(length).decode()
             return urllib.parse.parse_qs(body)
 
+    def _check_auth(self):
+        """Check if user is authenticated, redirect to login if not."""
+        cookie = self.headers.get("Cookie", "")
+        token = get_session_from_cookie(cookie)
+        db = get_db()
+        user = verify_session(db, token) if token else None
+        db.close()
+        return user
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
+
+        # Check auth for all pages except /login and /api/accio-push and /api/track
+        if not path.startswith("/api/") and path != "/login":
+            user = self._check_auth()
+            if not user:
+                self._redirect("/login")
+                return
+
         db = get_db()
 
         try:
-            if path == "/":
+            if path == "/login":
+                self._send(200, page_login())
+            elif path == "/logout":
+                self._send(200, page_login())
+                self._redirect("/login")
+            elif path == "/":
                 self._send(200, page_dashboard(db))
             elif path == "/applicants":
                 self._send(200, page_applicants(db, params))
             elif path == "/applicants/add":
                 self._send(200, page_add_applicant())
+            elif path == "/clients":
+                self._send(200, page_clients(db, params))
             elif path == "/codes":
                 self._send(200, page_codes(db, params))
             elif path == "/codes/import":
@@ -1109,6 +1940,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, page_settings(db))
             elif path == "/logs":
                 self._send(200, page_logs(db))
+            elif path.startswith("/api/track/"):
+                # Email tracking pixel endpoint
+                token = path.split("/api/track/")[1]
+                try:
+                    db.execute(
+                        "UPDATE email_tracking SET opened_at=NOW(), open_count=open_count+1, user_agent=%s WHERE tracking_token=%s",
+                        (self.headers.get("User-Agent", ""), token)
+                    )
+                    # Update applicant status to opened
+                    tracking = db.execute(
+                        "SELECT applicant_id FROM email_tracking WHERE tracking_token=%s",
+                        (token,)
+                    ).fetchone()
+                    if tracking:
+                        db.execute(
+                            "UPDATE applicants SET status='opened' WHERE id=%s",
+                            (tracking["applicant_id"],)
+                        )
+                except Exception as e:
+                    logger.error(f"Tracking error: {e}")
+
+                # Return 1x1 transparent GIF
+                gif = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x01\x0a\x00\x01\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x4d\x01\x00\x3b'
+                self.send_response(200)
+                self.send_header("Content-Type", "image/gif")
+                self.send_header("Content-Length", str(len(gif)))
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.end_headers()
+                self.wfile.write(gif)
             elif path == "/api/debug-xml":
                 # Return the full raw XML from the most recent xml_log entry
                 row = db.execute("SELECT raw_xml FROM xml_log ORDER BY id DESC LIMIT 1").fetchone()
@@ -1150,7 +2010,33 @@ class Handler(BaseHTTPRequestHandler):
         db = get_db()
 
         try:
-            # Accio Data XML push endpoint
+            # Login endpoint
+            if path == "/login":
+                form_data = self._parse_form()
+                def fv(name, default=""):
+                    if isinstance(form_data, cgi.FieldStorage):
+                        item = form_data.getfirst(name, default)
+                        return item if isinstance(item, str) else item.decode() if item else default
+                    else:
+                        vals = form_data.get(name, [default])
+                        return vals[0] if vals else default
+
+                username = fv("username")
+                password = fv("password")
+
+                # Find user
+                user = db.execute("SELECT * FROM users WHERE username=%s AND is_active=TRUE", (username,)).fetchone()
+                if user and verify_password(password, user["password_hash"]):
+                    # Valid login
+                    token = create_session(db, user["id"])
+                    db.execute("UPDATE users SET last_login=NOW() WHERE id=%s", (user["id"],))
+                    self._redirect("/", set_cookie=token)
+                else:
+                    # Invalid login
+                    self._send(200, page_login())
+                return
+
+            # Accio Data XML push endpoint (NO session auth required)
             if path == "/api/accio-push":
               try:
                 ACCIO_USERNAME = os.environ.get("ACCIO_USERNAME", "admin")
@@ -1257,8 +2143,21 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         ex = db.execute("SELECT id FROM applicants WHERE accio_order_number = %s", (a["accio_order_number"],)).fetchone() if a["accio_order_number"] else None
                         if not ex:
-                            cur = db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-                                       (a["first_name"],a["last_name"],a["email"],a["phone"],a["accio_order_number"],a["accio_remote_number"]))
+                            # Auto-create or find client
+                            client_id = None
+                            if a.get("company_name"):
+                                client = db.execute("SELECT id FROM clients WHERE company_name=%s", (a["company_name"],)).fetchone()
+                                if not client:
+                                    cur = db.execute(
+                                        "INSERT INTO clients (company_name, account_name) VALUES (%s, %s) RETURNING id",
+                                        (a["company_name"], a.get("account_name", ""))
+                                    )
+                                    client_id = cur.fetchone()["id"]
+                                else:
+                                    client_id = client["id"]
+
+                            cur = db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number,client_id) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                                       (a["first_name"],a["last_name"],a["email"],a["phone"],a["accio_order_number"],a["accio_remote_number"],client_id))
                             new_id = cur.fetchone()["id"]
                             added += 1
                             # Auto-assign a payment code if enabled
@@ -1266,7 +2165,7 @@ class Handler(BaseHTTPRequestHandler):
                                 code_row = db.execute("SELECT id, code FROM codes WHERE assigned_to IS NULL LIMIT 1").fetchone()
                                 if code_row:
                                     db.execute("UPDATE codes SET assigned_to=%s, assigned_date=NOW() WHERE id = %s", (new_id, code_row["id"]))
-                                    db.execute("UPDATE applicants SET assigned_code=%s WHERE id = %s", (code_row["code"], new_id))
+                                    db.execute("UPDATE applicants SET assigned_code=%s, status='code_assigned' WHERE id = %s", (code_row["code"], new_id))
                                     db.commit()
                                     # Auto-send email if enabled
                                     if auto_email and a["email"]:
@@ -1298,6 +2197,12 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 self._send(500, '<?xml version="1.0" encoding="UTF-8"?>\n<BackgroundReports><error>Internal server error</error></BackgroundReports>', "text/xml")
+                return
+
+            # Check auth for all other POST endpoints
+            user = self._check_auth()
+            if not user:
+                self._redirect("/login")
                 return
 
             # API: Bulk code upload (JSON)
@@ -1388,6 +2293,13 @@ class Handler(BaseHTTPRequestHandler):
                     assign_code(db, aid)
                 ok, msg = send_release_email(db, aid)
                 flash("Code assigned & email sent!" if ok else f"Code assigned but email failed: {msg}", "success" if ok else "error")
+                self._redirect("/applicants")
+
+            elif path.startswith("/applicants/") and path.endswith("/mark-complete"):
+                aid = int(path.split("/")[2])
+                db.execute("UPDATE applicants SET status='completed' WHERE id = %s", (aid,))
+                db.commit()
+                flash("Applicant marked complete.", "success")
                 self._redirect("/applicants")
 
             elif path.startswith("/applicants/") and path.endswith("/delete"):
@@ -1493,14 +2405,23 @@ class Handler(BaseHTTPRequestHandler):
                         msg["From"] = f"{sname} <{sender}>"
                         msg["To"] = addr
                         msg["Subject"] = "Test - Fingerprint Release Manager"
-                        srv = smtplib.SMTP(srv_host, srv_port)
-                        if use_tls: srv.starttls()
-                        if srv_user and srv_pass: srv.login(srv_user, srv_pass)
+                        logger.info(f"Test email: Connecting to {srv_host}:{srv_port} (TLS={use_tls})")
+                        logger.info(f"Test email: From={sender}, To={addr}, User={srv_user}")
+                        srv = smtplib.SMTP(srv_host, srv_port, timeout=15)
+                        srv.set_debuglevel(1)
+                        if use_tls:
+                            srv.starttls()
+                            logger.info("Test email: TLS established")
+                        if srv_user and srv_pass:
+                            srv.login(srv_user, srv_pass)
+                            logger.info("Test email: Login successful")
                         srv.send_message(msg)
                         srv.quit()
+                        logger.info(f"Test email: Sent successfully to {addr}")
                         flash(f"Test email sent to {addr}!", "success")
                     except Exception as e:
-                        flash(f"Test failed: {e}", "error")
+                        logger.error(f"Test email FAILED: {type(e).__name__}: {e}")
+                        flash(f"Test failed: {type(e).__name__}: {e}", "error")
                 self._redirect("/settings")
             else:
                 self._send(404, "Not found")
@@ -1515,8 +2436,12 @@ if __name__ == "__main__":
     start_folder_watcher()
     print(f"""
     ╔══════════════════════════════════════════════════════════╗
-    ║   Fingerprint Release Manager                            ║
+    ║   Fingerprint Release Manager v2.0                       ║
     ║   Web UI:      http://localhost:{PORT}                     ║
+    ║                                                          ║
+    ║   DEFAULT LOGIN:                                         ║
+    ║   Username: admin                                        ║
+    ║   Password: admin123                                     ║
     ║                                                          ║
     ║   AUTO-IMPORT:                                           ║
     ║   Drop .xlsx/.csv files into the 'watch/' folder         ║
@@ -1527,6 +2452,7 @@ if __name__ == "__main__":
     ║   POST /api/accio-push     (Accio Data XML results)      ║
     ║   POST /api/codes          (JSON: {{"codes":["..."]}} )    ║
     ║   POST /api/codes/upload   (Multipart file upload)       ║
+    ║   GET  /api/track/{{token}} (Email tracking pixel)        ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     server = HTTPServer((HOST, PORT), Handler)
