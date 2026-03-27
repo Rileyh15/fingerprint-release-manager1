@@ -663,7 +663,7 @@ def send_release_email(db, applicant_id):
             (applicant_id, email_log_id, tracking_token)
         )
 
-        db.execute("UPDATE applicants SET email_sent=1, email_sent_at=%s, status='emailed', updated_at=%s WHERE id = %s", (now, now, applicant_id))
+        db.execute("UPDATE applicants SET email_sent=TRUE, email_sent_at=%s, status='emailed', updated_at=%s WHERE id = %s", (now, now, applicant_id))
         db.commit()
         return True, "Email sent"
     except Exception as e:
