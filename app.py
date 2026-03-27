@@ -607,26 +607,37 @@ def send_release_email(db, applicant_id):
     subj = get_setting(db, "email_subject").format(**reps)
     body = get_setting(db, "email_body").format(**reps)
 
-    msg = MIMEMultipart()
+    msg = MIMEMultipart("mixed")
     msg["From"] = f"{sender_name} <{sender_email}>"
     msg["To"] = a["email"]
     msg["Subject"] = subj
+    msg["Reply-To"] = sender_email
+    msg["X-Mailer"] = "FP Release Manager"
+    msg["MIME-Version"] = "1.0"
 
     # Create tracking token and insert tracking record
     tracking_token = str(uuid.uuid4())
     tracking_pixel = f'<img src="https://fingerprint-release-manager1.onrender.com/api/track/{tracking_token}" width="1" height="1" alt="" />'
 
-    # Convert body to HTML with tracking pixel
-    html_body = f"""
-    <html>
-    <body style="font-family: Arial, sans-serif; line-height: 1.6;">
-    <pre style="white-space: pre-wrap; word-wrap: break-word;">{h(body)}</pre>
-    {tracking_pixel}
-    </body>
-    </html>
-    """
+    # Build both plain text and HTML versions for better deliverability
+    alt_part = MIMEMultipart("alternative")
 
-    msg.attach(MIMEText(html_body, "html"))
+    # Plain text version (spam filters like seeing this)
+    alt_part.attach(MIMEText(body, "plain"))
+
+    # HTML version with tracking pixel
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
+<p>{h(body).replace(chr(10), '<br>')}</p>
+<p style="color: #666; font-size: 12px; margin-top: 30px;">This is an automated message from BR Solutions. Please do not reply directly to this email.</p>
+{tracking_pixel}
+</body>
+</html>"""
+
+    alt_part.attach(MIMEText(html_body, "html"))
+    msg.attach(alt_part)
 
     rfp = get_setting(db, "release_form_path")
     if rfp and os.path.exists(rfp):
