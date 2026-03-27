@@ -1,0 +1,10 @@
+services:
+  - type: web
+      name: fingerprint-release-manager
+          runtime: python
+              buildCommand: pip install -r requirements.txt
+                  startCommand: python3 app.py
+                      envVars:
+                            - key: PORT
+                                    value: 5000
+                                        plan: free
