@@ -1,7 +1,7 @@
 """
 Fingerprint Release Manager - v2.0
 Integrates with Accio Data XML API to automate fingerprint release form distribution.
- 
+
 New Features:
 - Multi-user login system with session management
 - Client tracking from Accio XML
@@ -9,17 +9,17 @@ New Features:
 - Email open tracking with pixels
 - Applicant status workflow
 - Clients management page
- 
+
 Workflow:
 1. Receives applicant data via XML push from Accio Data (or manual entry)
 2. Manages a pool of IdentoGO one-time payment codes (imported from Excel)
 3. Assigns a code to each applicant
 4. Emails the applicant their fingerprint release form PDF with their assigned code
 5. Tracks email opens and applicant status
- 
+
 Built with Python standard library + openpyxl for Excel support.
 """
- 
+
 import os
 import sys
 import json
@@ -41,7 +41,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from xml.etree import ElementTree as ET
 from string import Template
- 
+
 try:
     import psycopg2
     import psycopg2.extras
@@ -49,7 +49,7 @@ try:
 except ImportError:
     HAS_PG = False
     print("WARNING: psycopg2 not installed. Install with: pip install psycopg2-binary")
- 
+
 try:
     import openpyxl
     HAS_OPENPYXL = True
@@ -57,7 +57,7 @@ except ImportError:
     HAS_OPENPYXL = False
     print("WARNING: openpyxl not installed. Excel import will be limited to CSV only.")
     print("Install with: pip install openpyxl")
- 
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -70,14 +70,14 @@ TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 5000))
- 
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(WATCH_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
- 
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
- 
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -85,23 +85,23 @@ class DBHelper:
     """Wrapper to provide sqlite3-like interface over psycopg2."""
     def __init__(self, conn):
         self._conn = conn
- 
+
     def execute(self, sql, params=None):
         cur = self._conn.cursor()
         cur.execute(sql, params or ())
         return cur
- 
+
     def commit(self):
         pass  # autocommit is on
- 
+
     def close(self):
         self._conn.close()
- 
+
 def get_db():
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     conn.autocommit = True
     return DBHelper(conn)
- 
+
 def init_db():
     db = get_db()
     cur = db.execute("""
@@ -204,15 +204,15 @@ def init_db():
             received_at TIMESTAMP DEFAULT NOW()
         )
     """)
- 
+
     # Add new columns to existing tables if they don't exist
     try:
         db.execute("ALTER TABLE applicants ADD COLUMN client_id INTEGER REFERENCES clients(id)")
     except psycopg2.Error:
         pass  # Column already exists
- 
+
     db.close()
- 
+
     # Create default admin user if no users exist
     db = get_db()
     users = db.execute("SELECT COUNT(*) as cnt FROM users").fetchone()
@@ -227,7 +227,7 @@ def init_db():
         )
         logger.info("Created default admin user: admin / admin123")
     db.close()
- 
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -245,21 +245,21 @@ DEFAULT_SETTINGS = {
     "sender_name": "Fingerprints Required",
     "email_subject": "Your Fingerprint Release Form & Payment Code",
     "email_body": """Dear {first_name} {last_name},
- 
+
 Please find attached your Fingerprint Release Form for processing.
- 
+
 Your one-time IdentoGO payment code is: {code}
- 
+
 This code covers the cost of your fingerprint processing. When you visit the IdentoGO location, provide this code so that the fee is charged to our company account. Do NOT pay out of pocket.
- 
+
 Instructions:
 1. Download and review the attached Fingerprint Release Form
 2. Visit your assigned IdentoGO location
 3. When prompted for payment, enter code: {code}
 4. Complete the fingerprinting process
- 
+
 If you have any questions, please contact us.
- 
+
 Thank you.""",
     "release_form_path": "",
     "company_name": "Background Research Solutions, LLC",
@@ -267,17 +267,17 @@ Thank you.""",
     "auto_assign_codes": "1",
     "auto_send_email": "1",
 }
- 
+
 def get_setting(db, key):
     cur = db.execute("SELECT value FROM settings WHERE key = %s", (key,))
     row = cur.fetchone()
     if row:
         return row["value"]
     return DEFAULT_SETTINGS.get(key, "")
- 
+
 def set_setting(db, key, value):
     cur = db.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
- 
+
 # ---------------------------------------------------------------------------
 # Authentication & Session Management
 # ---------------------------------------------------------------------------
@@ -290,7 +290,7 @@ def hash_password(password, salt=None):
     h = hashlib.sha256(password.encode() + salt).hexdigest()
     salt_b64 = base64.b64encode(salt).decode()
     return f"{h}${salt_b64}"
- 
+
 def verify_password(password, password_with_salt):
     """Verify a password against a hash."""
     try:
@@ -300,7 +300,7 @@ def verify_password(password, password_with_salt):
         return computed == h
     except Exception:
         return False
- 
+
 def create_session(db, user_id):
     """Create a new session token for a user."""
     token = str(uuid.uuid4())
@@ -310,7 +310,7 @@ def create_session(db, user_id):
         (token, user_id, expires_at)
     )
     return token
- 
+
 def verify_session(db, token):
     """Verify a session token and return user data if valid."""
     if not token:
@@ -320,7 +320,7 @@ def verify_session(db, token):
         (token,)
     )
     return cur.fetchone()
- 
+
 def get_session_from_cookie(cookie_header):
     """Extract session token from cookie header."""
     if not cookie_header:
@@ -330,7 +330,7 @@ def get_session_from_cookie(cookie_header):
         if part.startswith("session_token="):
             return part.split("=", 1)[1]
     return None
- 
+
 # ---------------------------------------------------------------------------
 # XML Parsing
 # ---------------------------------------------------------------------------
@@ -340,7 +340,7 @@ def parse_accio_xml(xml_string):
         root = ET.fromstring(xml_string)
     except ET.ParseError as e:
         return applicants, str(e)
- 
+
     # --- Format 1: ScreeningResults (completeOrder / placeOrder) ---
     for complete_order in root.iter("completeOrder"):
         order_number = complete_order.get("number", "")
@@ -354,7 +354,7 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_number, company_name=""))
- 
+
     for po in root.iter("placeOrder"):
         # Get company name from accountInfo
         company_name = ""
@@ -366,7 +366,7 @@ def parse_accio_xml(xml_string):
         ci = po.find("clientInfo")
         if ci is not None:
             account_name = _xt(ci, "account")
- 
+
         # Get email/phone from orderInfo (Accio puts contact info here, not in subject)
         oi = po.find("orderInfo")
         oi_email = ""
@@ -395,7 +395,7 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=po.get("number", ""),
                                        accio_remote_number="", company_name=company_name, account_name=account_name))
- 
+
     # --- Format 2: Action Letter XML Post (postLetter with orderInfo) ---
     for post_letter in root.iter("postLetter"):
         order_number = post_letter.get("remote_order", "") or post_letter.get("order", "")
@@ -415,7 +415,7 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_order, company_name="", account_name=""))
- 
+
     # --- Format 3: Vendor dispatch XML (orderRequest with subject) ---
     for order_req in root.iter("orderRequest"):
         order_number = order_req.get("order", "") or order_req.get("number", "")
@@ -429,7 +429,7 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_number, company_name="", account_name=""))
- 
+
     # --- Format 4: Generic fallback - look for PersonalData or BackgroundSearchPackage ---
     if not applicants:
         for pd in root.iter("PersonalData"):
@@ -449,7 +449,7 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number="",
                                        accio_remote_number="", company_name="", account_name=""))
- 
+
     # --- Format 5: AccioOrder XML format (placeOrder > subject) ---
     # Accio sends: <AccioOrder><placeOrder number="..."><orderInfo><requester_email>...
     #              <subject><name_first>...<name_last>... (NO email/phone in subject!)
@@ -467,7 +467,7 @@ def parse_accio_xml(xml_string):
             ci = place_order.find("clientInfo")
             if ci is not None:
                 account_name = _xt(ci, "account")
- 
+
             # Get email/phone from orderInfo (sibling of subject within placeOrder)
             order_info = place_order.find("orderInfo")
             order_email = ""
@@ -510,7 +510,7 @@ def parse_accio_xml(xml_string):
                     applicants.append(dict(first_name=first, last_name=last, email=email,
                                            phone=phone, accio_order_number=order_number,
                                            accio_remote_number="", company_name=company_name, account_name=account_name))
- 
+
     # --- Format 5b: Also try <order> tag (older AccioOrder variants) ---
     if not applicants:
         for order in root.iter("order"):
@@ -539,14 +539,14 @@ def parse_accio_xml(xml_string):
                     applicants.append(dict(first_name=first, last_name=last, email=email,
                                            phone=phone, accio_order_number=order_number,
                                            accio_remote_number=remote_number, company_name="", account_name=""))
- 
+
     # --- Deep scan fallback: look for name_first/name_last pairs anywhere ---
     if not applicants:
         def deep_scan_for_applicants(elem, parent_map=None):
             found = []
             if parent_map is None:
                 parent_map = {c: p for p in elem.iter() for c in p}
- 
+
             for el in elem.iter():
                 if el.tag == "name_first" and el.text:
                     first = el.text.strip()
@@ -570,15 +570,15 @@ def parse_accio_xml(xml_string):
                                             phone=phone, accio_order_number="",
                                             accio_remote_number="", company_name="", account_name=""))
             return found
- 
+
         applicants = deep_scan_for_applicants(root)
- 
+
     return applicants, None
- 
+
 def _xt(el, tag):
     c = el.find(tag)
     return c.text.strip() if c is not None and c.text else ""
- 
+
 # ---------------------------------------------------------------------------
 # Email
 # ---------------------------------------------------------------------------
@@ -587,7 +587,7 @@ def send_release_email(db, applicant_id):
     if not a: return False, "Applicant not found"
     if not a["email"]: return False, "No email address"
     if not a["assigned_code"]: return False, "No code assigned"
- 
+
     smtp_server = get_setting(db, "smtp_server")
     smtp_port = int(get_setting(db, "smtp_port") or 587)
     smtp_user = get_setting(db, "smtp_username")
@@ -595,27 +595,27 @@ def send_release_email(db, applicant_id):
     use_tls = get_setting(db, "smtp_use_tls") == "1"
     sender_email = get_setting(db, "sender_email")
     sender_name = get_setting(db, "sender_name")
- 
+
     if not smtp_server or not sender_email:
         return False, "SMTP not configured. Go to Settings."
- 
+
     reps = dict(first_name=a["first_name"], last_name=a["last_name"],
                 email=a["email"], code=a["assigned_code"],
                 company_name=get_setting(db, "company_name"),
                 ori_number=get_setting(db, "ori_number"))
- 
+
     subj = get_setting(db, "email_subject").format(**reps)
     body = get_setting(db, "email_body").format(**reps)
- 
+
     msg = MIMEMultipart()
     msg["From"] = f"{sender_name} <{sender_email}>"
     msg["To"] = a["email"]
     msg["Subject"] = subj
- 
+
     # Create tracking token and insert tracking record
     tracking_token = str(uuid.uuid4())
     tracking_pixel = f'<img src="https://fingerprint-release-manager1.onrender.com/api/track/{tracking_token}" width="1" height="1" alt="" />'
- 
+
     # Convert body to HTML with tracking pixel
     html_body = f"""
     <html>
@@ -625,9 +625,9 @@ def send_release_email(db, applicant_id):
     </body>
     </html>
     """
- 
+
     msg.attach(MIMEText(html_body, "html"))
- 
+
     rfp = get_setting(db, "release_form_path")
     if rfp and os.path.exists(rfp):
         with open(rfp, "rb") as f:
@@ -636,36 +636,43 @@ def send_release_email(db, applicant_id):
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", 'attachment; filename="Fingerprint_Release_Form.pdf"')
             msg.attach(part)
- 
+
     try:
-        srv = smtplib.SMTP(smtp_server, smtp_port)
+        logger.info(f"SMTP: Connecting to {smtp_server}:{smtp_port} (TLS={use_tls})")
+        logger.info(f"SMTP: From={sender_email}, To={a['email']}, User={smtp_user}")
+        srv = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
+        srv.set_debuglevel(1)
         if use_tls:
             srv.starttls()
+            logger.info("SMTP: TLS established")
         if smtp_user and smtp_pass:
             srv.login(smtp_user, smtp_pass)
+            logger.info("SMTP: Login successful")
         srv.send_message(msg)
+        logger.info("SMTP: Message sent successfully")
         srv.quit()
- 
+
         now = datetime.now().isoformat()
         cur = db.execute("INSERT INTO email_log (applicant_id,recipient_email,subject,status) VALUES (%s,%s,%s,'sent') RETURNING id",
                         (applicant_id, a["email"], subj))
         email_log_id = cur.fetchone()["id"]
- 
+
         # Create tracking record
         db.execute(
             "INSERT INTO email_tracking (applicant_id, email_log_id, tracking_token) VALUES (%s, %s, %s)",
             (applicant_id, email_log_id, tracking_token)
         )
- 
+
         db.execute("UPDATE applicants SET email_sent=1, email_sent_at=%s, status='emailed', updated_at=%s WHERE id = %s", (now, now, applicant_id))
         db.commit()
         return True, "Email sent"
     except Exception as e:
+        logger.error(f"SMTP FAILED: {type(e).__name__}: {e}")
         db.execute("INSERT INTO email_log (applicant_id,recipient_email,subject,status,error_message) VALUES (%s,%s,%s,'failed',%s)",
                    (applicant_id, a["email"], subj, str(e)))
         db.commit()
         return False, str(e)
- 
+
 def assign_code(db, applicant_id):
     a = db.execute("SELECT * FROM applicants WHERE id = %s", (applicant_id,)).fetchone()
     if not a: return None, "Not found"
@@ -677,7 +684,7 @@ def assign_code(db, applicant_id):
     db.execute("UPDATE applicants SET assigned_code=%s, status='code_assigned', updated_at=%s WHERE id = %s", (code_row["code"], now, applicant_id))
     db.commit()
     return code_row["code"], "OK"
- 
+
 def import_codes_from_file(filepath, column_index=0, skip_header=True, batch_name=None):
     imported = 0
     duplicates = 0
@@ -720,7 +727,7 @@ def import_codes_from_file(filepath, column_index=0, skip_header=True, batch_nam
     except Exception as e:
         error_msg = str(e)
     return imported, duplicates, error_msg
- 
+
 def auto_detect_code_column(filepath):
     """Try to guess which column has the payment codes."""
     if filepath.endswith(".xlsx") and HAS_OPENPYXL:
@@ -741,9 +748,9 @@ def auto_detect_code_column(filepath):
         except Exception:
             pass
     return 0
- 
+
 _watcher_running = True
- 
+
 def start_folder_watcher():
     """Monitor watch folder and auto-import codes from dropped files."""
     import threading
@@ -768,14 +775,14 @@ def start_folder_watcher():
             time.sleep(5)
     t = threading.Thread(target=watch, daemon=True)
     t.start()
- 
+
 # ---------------------------------------------------------------------------
 # HTML Utilities
 # ---------------------------------------------------------------------------
 def h(text):
     """HTML escape."""
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
- 
+
 def fmt_dt(val):
     """Format datetime for display."""
     if not val: return "-"
@@ -785,7 +792,7 @@ def fmt_dt(val):
         except Exception:
             return val
     return val.strftime("%Y-%m-%d %H:%M")
- 
+
 def render_page(title, content, active=""):
     """Render a full page with navigation."""
     html = f"""
@@ -1182,14 +1189,14 @@ def render_page(title, content, active=""):
     </html>
     """
     return html
- 
+
 def flash(msg, cat="success"):
     """Store a flash message in session."""
     # For now, use simple in-memory storage (in production, store in session)
     pass
- 
+
 _flashes = {}
- 
+
 def render_flashes():
     """Render any pending flash messages."""
     global _flashes
@@ -1200,7 +1207,7 @@ def render_flashes():
         html += f'<div class="alert alert-{cat}"><i class="fas fa-check-circle"></i> {h(msg)}</div>'
     _flashes = {}
     return html
- 
+
 # Page renderers
 def page_login():
     """Login page."""
@@ -1331,7 +1338,7 @@ def page_login():
     </body>
     </html>
     """
- 
+
 def page_dashboard(db):
     """Dashboard with analytics."""
     total_app = db.execute("SELECT COUNT(*) as cnt FROM applicants").fetchone()["cnt"]
@@ -1339,7 +1346,7 @@ def page_dashboard(db):
     emailed = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='emailed'").fetchone()["cnt"]
     codes_avail = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NULL").fetchone()["cnt"]
     codes_used = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NOT NULL").fetchone()["cnt"]
- 
+
     # Recent activity
     activity = db.execute("""
         SELECT type, id, col1, col2, ts FROM (
@@ -1350,7 +1357,7 @@ def page_dashboard(db):
         ORDER BY ts DESC NULLS LAST
         LIMIT 10
     """).fetchall()
- 
+
     # Clients
     clients = db.execute("""
         SELECT c.id, c.company_name, c.account_name, COUNT(a.id) as app_count
@@ -1360,7 +1367,7 @@ def page_dashboard(db):
         ORDER BY app_count DESC
         LIMIT 5
     """).fetchall()
- 
+
     stats_html = f"""
     <div class="stats">
         <div class="stat-card">
@@ -1390,7 +1397,7 @@ def page_dashboard(db):
         </div>
     </div>
     """
- 
+
     clients_html = """
     <div class="card">
         <div class="card-title">
@@ -1419,7 +1426,7 @@ def page_dashboard(db):
         </table>
     </div>
     """
- 
+
     activity_html = """
     <div class="card">
         <div class="card-title">
@@ -1457,16 +1464,16 @@ def page_dashboard(db):
         </table>
     </div>
     """
- 
+
     return render_page("Dashboard", stats_html + clients_html + activity_html, active="dashboard")
- 
+
 def page_applicants(db, params):
     """List and manage applicants."""
     search = (params.get("search", [None])[0] or "").lower()
     rows = db.execute("SELECT * FROM applicants ORDER BY created_at DESC").fetchall()
     if search:
         rows = [r for r in rows if search in f"{r['first_name']} {r['last_name']}".lower()]
- 
+
     content = f"""
     <div style="margin-bottom: 1rem; display: flex; gap: 0.5rem;">
         <form method="GET" style="flex: 1; display: flex; gap: 0.5rem;">
@@ -1492,7 +1499,7 @@ def page_applicants(db, params):
             </thead>
             <tbody>
     """
- 
+
     for r in rows:
         # Check if email was opened
         email_status = ""
@@ -1507,7 +1514,7 @@ def page_applicants(db, params):
                 email_status = '<span class="email-status email-status-opened"></span> Yes'
             else:
                 email_status = '<span class="email-status email-status-not-opened"></span> No'
- 
+
         content += f"""
                 <tr>
                     <td><span class="status-badge status-{r['status']}">{h(r['status'])}</span></td>
@@ -1533,14 +1540,14 @@ def page_applicants(db, params):
                     </td>
                 </tr>
         """
- 
+
     content += """
             </tbody>
         </table>
     </div>
     """
     return render_page("Applicants", content, active="applicants")
- 
+
 def page_add_applicant():
     """Add applicant form."""
     content = """
@@ -1580,14 +1587,14 @@ def page_add_applicant():
     </div>
     """
     return render_page("Add Applicant", content, active="applicants")
- 
+
 def page_codes(db, params):
     """Manage payment codes."""
     avail = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NULL").fetchone()["cnt"]
     assigned = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NOT NULL").fetchone()["cnt"]
- 
+
     rows = db.execute("SELECT * FROM codes ORDER BY imported_at DESC LIMIT 100").fetchall()
- 
+
     content = f"""
     <div style="margin-bottom: 1rem; display: flex; gap: 0.5rem;">
         <a href="/codes/import" class="btn btn-primary"><i class="fas fa-upload"></i> Import from File</a>
@@ -1618,14 +1625,14 @@ def page_codes(db, params):
             </thead>
             <tbody>
     """
- 
+
     for r in rows[:50]:
         assigned_to = "-"
         if r["assigned_to"]:
             a = db.execute("SELECT first_name, last_name FROM applicants WHERE id = %s", (r["assigned_to"],)).fetchone()
             if a:
                 assigned_to = f"{h(a['first_name'])} {h(a['last_name'])}"
- 
+
         content += f"""
                 <tr>
                     <td><code>{h(r['code'])}</code></td>
@@ -1635,14 +1642,14 @@ def page_codes(db, params):
                     <td>{fmt_dt(r['imported_at'])}</td>
                 </tr>
         """
- 
+
     content += """
             </tbody>
         </table>
     </div>
     """
     return render_page("Payment Codes", content, active="codes")
- 
+
 def page_import_codes():
     """Import codes from file."""
     content = """
@@ -1672,7 +1679,7 @@ def page_import_codes():
     </div>
     """
     return render_page("Import Payment Codes", content, active="codes")
- 
+
 def page_settings(db):
     """Settings page."""
     content = """
@@ -1744,11 +1751,11 @@ def page_settings(db):
         h(get_setting(db, "email_body"))
     )
     return render_page("Settings", content, active="settings")
- 
+
 def page_logs(db):
     """View XML logs."""
     rows = db.execute("SELECT * FROM xml_log ORDER BY id DESC LIMIT 50").fetchall()
- 
+
     content = """
     <div class="card">
         <table>
@@ -1763,7 +1770,7 @@ def page_logs(db):
             </thead>
             <tbody>
     """
- 
+
     for r in rows:
         content += f"""
                 <tr>
@@ -1774,26 +1781,26 @@ def page_logs(db):
                     <td>{fmt_dt(r['received_at'])}</td>
                 </tr>
         """
- 
+
     content += """
             </tbody>
         </table>
     </div>
     """
     return render_page("Logs", content, active="logs")
- 
+
 def page_clients(db, params):
     """Clients page."""
     client_id = params.get("client_id", [None])[0]
- 
+
     if client_id:
         # Show applicants for specific client
         client = db.execute("SELECT * FROM clients WHERE id = %s", (int(client_id),)).fetchone()
         if not client:
             return render_page("Not Found", '<div class="es"><i class="fas fa-exclamation-triangle"></i><h3>Client not found</h3></div>', active="clients")
- 
+
         applicants = db.execute("SELECT * FROM applicants WHERE client_id = %s ORDER BY created_at DESC", (int(client_id),)).fetchall()
- 
+
         content = f"""
         <a href="/clients" class="btn" style="background: var(--gray-300); color: var(--gray-900); margin-bottom: 1rem;"><i class="fas fa-arrow-left"></i> Back</a>
         <div class="card">
@@ -1816,7 +1823,7 @@ def page_clients(db, params):
                 </thead>
                 <tbody>
         """
- 
+
         for a in applicants:
             content += f"""
                     <tr>
@@ -1826,7 +1833,7 @@ def page_clients(db, params):
                         <td><code>{h(a['assigned_code'] or '-')}</code></td>
                     </tr>
             """
- 
+
         content += """
                 </tbody>
             </table>
@@ -1841,7 +1848,7 @@ def page_clients(db, params):
             GROUP BY c.id
             ORDER BY app_count DESC
         """).fetchall()
- 
+
         content = """
         <div class="card">
             <table>
@@ -1857,7 +1864,7 @@ def page_clients(db, params):
                 </thead>
                 <tbody>
         """
- 
+
         for c in clients:
             content += f"""
                     <tr>
@@ -1869,36 +1876,36 @@ def page_clients(db, params):
                         <td><a href="/clients?client_id={c['id']}" class="btn btn-primary btn-small">View</a></td>
                     </tr>
             """
- 
+
         content += """
                 </tbody>
             </table>
         </div>
         """
- 
+
     return render_page("Clients", content, active="clients")
- 
+
 # ---------------------------------------------------------------------------
 # HTTP Handler
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         logger.info(f"{self.client_address[0]} - {fmt % args}")
- 
+
     def _send(self, code, body, ct="text/html"):
         self.send_response(code)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body.encode())))
         self.end_headers()
         self.wfile.write(body.encode())
- 
+
     def _redirect(self, url, set_cookie=None):
         self.send_response(303)
         self.send_header("Location", url)
         if set_cookie:
             self.send_header("Set-Cookie", f"session_token={set_cookie}; Path=/; HttpOnly; Max-Age=86400")
         self.end_headers()
- 
+
     def _parse_form(self):
         ct = self.headers.get("Content-Type", "")
         length = int(self.headers.get("Content-Length", 0))
@@ -1909,7 +1916,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             body = self.rfile.read(length).decode()
             return urllib.parse.parse_qs(body)
- 
+
     def _check_auth(self):
         """Check if user is authenticated, redirect to login if not."""
         cookie = self.headers.get("Cookie", "")
@@ -1918,21 +1925,21 @@ class Handler(BaseHTTPRequestHandler):
         user = verify_session(db, token) if token else None
         db.close()
         return user
- 
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
- 
+
         # Check auth for all pages except /login and /api/accio-push and /api/track
         if not path.startswith("/api/") and path != "/login":
             user = self._check_auth()
             if not user:
                 self._redirect("/login")
                 return
- 
+
         db = get_db()
- 
+
         try:
             if path == "/login":
                 self._send(200, page_login())
@@ -1975,7 +1982,7 @@ class Handler(BaseHTTPRequestHandler):
                         )
                 except Exception as e:
                     logger.error(f"Tracking error: {e}")
- 
+
                 # Return 1x1 transparent GIF
                 gif = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x01\x0a\x00\x01\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x4d\x01\x00\x3b'
                 self.send_response(200)
@@ -2018,12 +2025,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, render_page("Not Found", '<div class="es"><i class="fas fa-exclamation-triangle"></i><h3>Page not found</h3></div>'))
         finally:
             db.close()
- 
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         db = get_db()
- 
+
         try:
             # Login endpoint
             if path == "/login":
@@ -2035,10 +2042,10 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         vals = form_data.get(name, [default])
                         return vals[0] if vals else default
- 
+
                 username = fv("username")
                 password = fv("password")
- 
+
                 # Find user
                 user = db.execute("SELECT * FROM users WHERE username=%s AND is_active=TRUE", (username,)).fetchone()
                 if user and verify_password(password, user["password_hash"]):
@@ -2050,7 +2057,7 @@ class Handler(BaseHTTPRequestHandler):
                     # Invalid login
                     self._send(200, page_login())
                 return
- 
+
             # Accio Data XML push endpoint (NO session auth required)
             if path == "/api/accio-push":
               try:
@@ -2170,7 +2177,7 @@ class Handler(BaseHTTPRequestHandler):
                                     client_id = cur.fetchone()["id"]
                                 else:
                                     client_id = client["id"]
- 
+
                             cur = db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number,client_id) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                                        (a["first_name"],a["last_name"],a["email"],a["phone"],a["accio_order_number"],a["accio_remote_number"],client_id))
                             new_id = cur.fetchone()["id"]
@@ -2213,13 +2220,13 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 self._send(500, '<?xml version="1.0" encoding="UTF-8"?>\n<BackgroundReports><error>Internal server error</error></BackgroundReports>', "text/xml")
                 return
- 
+
             # Check auth for all other POST endpoints
             user = self._check_auth()
             if not user:
                 self._redirect("/login")
                 return
- 
+
             # API: Bulk code upload (JSON)
             if path == "/api/codes":
                 length = int(self.headers.get("Content-Length", 0))
@@ -2246,7 +2253,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._send(500, json.dumps({"status": "error", "message": str(e)}), "application/json")
                 return
- 
+
             # API: Bulk code upload from file via multipart
             if path == "/api/codes/upload":
                 form_data = self._parse_form()
@@ -2269,10 +2276,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._send(400, json.dumps({"status": "error", "message": "Send file as multipart form with field name 'file'"}), "application/json")
                 return
- 
+
             # Form submissions
             form_data = self._parse_form()
- 
+
             def fv(name, default=""):
                 """Get form value from either FieldStorage or dict."""
                 if isinstance(form_data, cgi.FieldStorage):
@@ -2281,26 +2288,26 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     vals = form_data.get(name, [default])
                     return vals[0] if vals else default
- 
+
             if path == "/applicants/add":
                 db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,notes) VALUES (%s,%s,%s,%s,%s,%s)",
                            (fv("first_name"), fv("last_name"), fv("email"), fv("phone"), fv("accio_order_number"), fv("notes")))
                 db.commit()
                 flash("Applicant added.", "success")
                 self._redirect("/applicants")
- 
+
             elif path.startswith("/applicants/") and path.endswith("/assign-code"):
                 aid = int(path.split("/")[2])
                 code_val, msg = assign_code(db, aid)
                 flash(f"Code {code_val} assigned." if code_val else f"Failed: {msg}", "success" if code_val else "error")
                 self._redirect("/applicants")
- 
+
             elif path.startswith("/applicants/") and path.endswith("/send-email"):
                 aid = int(path.split("/")[2])
                 ok, msg = send_release_email(db, aid)
                 flash(msg, "success" if ok else "error")
                 self._redirect("/applicants")
- 
+
             elif path.startswith("/applicants/") and path.endswith("/assign-and-send"):
                 aid = int(path.split("/")[2])
                 a = db.execute("SELECT * FROM applicants WHERE id = %s", (aid,)).fetchone()
@@ -2309,10 +2316,10 @@ class Handler(BaseHTTPRequestHandler):
                 ok, msg = send_release_email(db, aid)
                 flash("Code assigned & email sent!" if ok else f"Code assigned but email failed: {msg}", "success" if ok else "error")
                 self._redirect("/applicants")
- 
+
             elif path.startswith("/applicants/") and path.endswith("/update-email"):
                 aid = int(path.split("/")[2])
-                new_email = form.get("email", [""])[0].strip()
+                new_email = fv("email").strip()
                 if new_email:
                     db.execute("UPDATE applicants SET email = %s, updated_at = NOW() WHERE id = %s", (new_email, aid))
                     db.commit()
@@ -2320,7 +2327,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     flash("Email cannot be blank.", "error")
                 self._redirect("/applicants")
- 
+
             elif path.startswith("/applicants/") and path.endswith("/resend"):
                 aid = int(path.split("/")[2])
                 a = db.execute("SELECT * FROM applicants WHERE id = %s", (aid,)).fetchone()
@@ -2334,14 +2341,14 @@ class Handler(BaseHTTPRequestHandler):
                     ok, msg = send_release_email(db, aid)
                     flash(f"Email resent to {a['email']}!" if ok else f"Resend failed: {msg}", "success" if ok else "error")
                 self._redirect("/applicants")
- 
+
             elif path.startswith("/applicants/") and path.endswith("/mark-complete"):
                 aid = int(path.split("/")[2])
                 db.execute("UPDATE applicants SET status='completed' WHERE id = %s", (aid,))
                 db.commit()
                 flash("Applicant marked complete.", "success")
                 self._redirect("/applicants")
- 
+
             elif path.startswith("/applicants/") and path.endswith("/delete"):
                 aid = int(path.split("/")[2])
                 # Free the assigned code back to the pool
@@ -2352,7 +2359,7 @@ class Handler(BaseHTTPRequestHandler):
                 db.commit()
                 flash("Applicant deleted.", "success")
                 self._redirect("/applicants")
- 
+
             elif path == "/applicants/bulk-process":
                 pending = db.execute("SELECT * FROM applicants WHERE status='pending' AND email IS NOT NULL AND email!=''").fetchall()
                 succ, fail = 0, 0
@@ -2366,7 +2373,7 @@ class Handler(BaseHTTPRequestHandler):
                         fail += 1; break
                 flash(f"Done: {succ} sent, {fail} failed.", "success")
                 self._redirect("/applicants")
- 
+
             elif path == "/codes/add-manual":
                 codes_text = fv("codes")
                 batch = fv("batch_name", "Manual")
@@ -2382,7 +2389,7 @@ class Handler(BaseHTTPRequestHandler):
                 db.commit()
                 flash(f"Added {imp} codes ({dup} duplicates skipped).", "success")
                 self._redirect("/codes")
- 
+
             elif path == "/codes/import":
                 if isinstance(form_data, cgi.FieldStorage):
                     file_item = form_data["file"]
@@ -2390,11 +2397,11 @@ class Handler(BaseHTTPRequestHandler):
                     skip_h = form_data.getfirst("skip_header") == "on"
                     batch = form_data.getfirst("batch_name", "Import")
                     fname = file_item.filename
- 
+
                     fpath = os.path.join(UPLOAD_FOLDER, f"import_{datetime.now().strftime('%Y%m%d%H%M%S')}_{fname}")
                     with open(fpath, "wb") as f:
                         f.write(file_item.file.read())
- 
+
                     # Use the optimized bulk import engine
                     imp, dup, err = import_codes_from_file(fpath, column_index=col_idx, skip_header=skip_h, batch_name=batch)
                     if err:
@@ -2403,7 +2410,7 @@ class Handler(BaseHTTPRequestHandler):
                         flash(f"Imported {imp} codes ({dup} duplicates) from '{batch}'.", "success")
                     if os.path.exists(fpath): os.remove(fpath)
                 self._redirect("/codes")
- 
+
             elif path == "/settings":
                 if isinstance(form_data, cgi.FieldStorage):
                     for key in DEFAULT_SETTINGS:
@@ -2427,7 +2434,7 @@ class Handler(BaseHTTPRequestHandler):
                             set_setting(db, key, vals[-1])
                 flash("Settings saved.", "success")
                 self._redirect("/settings")
- 
+
             elif path == "/settings/test-email":
                 addr = fv("test_email") or get_setting(db, "sender_email")
                 if not addr:
@@ -2467,7 +2474,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, "Not found")
         finally:
             db.close()
- 
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
