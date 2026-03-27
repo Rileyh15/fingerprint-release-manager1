@@ -129,16 +129,16 @@ def init_db():
 # Settings
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS = {
-    "accio_account": "",
-    "accio_username": "",
-    "accio_password": "",
-    "accio_post_url": "",
-    "smtp_server": "",
+    "accio_account": "brsolutions",
+    "accio_username": "admin",
+    "accio_password": "Fingerprint",
+    "accio_post_url": "https://fingerprint-release-manager1.onrender.com/api/accio-push",
+    "smtp_server": "smtp.office365.com",
     "smtp_port": "587",
-    "smtp_username": "",
-    "smtp_password": "",
+    "smtp_username": "apply2check@br-solutions.net",
+    "smtp_password": "BRS#mail@_985",
     "smtp_use_tls": "1",
-    "sender_email": "",
+    "sender_email": "apply2check@br-solutions.net",
     "sender_name": "Fingerprint Release Team",
     "email_subject": "Your Fingerprint Release Form & Payment Code",
     "email_body": """Dear {first_name} {last_name},
@@ -159,10 +159,10 @@ If you have any questions, please contact us.
 
 Thank you.""",
     "release_form_path": "",
-    "company_name": "",
+    "company_name": "Background Research Solutions, LLC",
     "ori_number": "",
-    "auto_assign_codes": "0",
-    "auto_send_email": "0",
+    "auto_assign_codes": "1",
+    "auto_send_email": "1",
 }
 
 def get_setting(db, key):
@@ -975,11 +975,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             # Accio Data XML push endpoint
             if path == "/api/accio-push":
-                # Validate Basic Auth credentials from Accio
                 ACCIO_USERNAME = os.environ.get("ACCIO_USERNAME", "admin")
                 ACCIO_PASSWORD = os.environ.get("ACCIO_PASSWORD", "Fingerprint")
-                auth_header = self.headers.get("Authorization", "")
+                # Read the body first (Accio may embed credentials in XML)
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length).decode()
                 auth_valid = False
+                # Method 1: HTTP Basic Auth header
+                auth_header = self.headers.get("Authorization", "")
                 if auth_header.startswith("Basic "):
                     try:
                         decoded = base64.b64decode(auth_header[6:]).decode()
@@ -988,15 +991,54 @@ class Handler(BaseHTTPRequestHandler):
                             auth_valid = True
                     except Exception:
                         pass
-                # Also check for credentials in XML or query params as fallback
+                # Method 2: Query params
                 qs = urllib.parse.parse_qs(parsed.query)
                 if not auth_valid and qs.get("username", [None])[0] == ACCIO_USERNAME and qs.get("password", [None])[0] == ACCIO_PASSWORD:
                     auth_valid = True
+                # Method 3: Credentials in the XML body (Accio XML format)
                 if not auth_valid:
+                    try:
+                        auth_root = ET.fromstring(raw)
+                        # Check for account/username/password elements at various levels
+                        for parent in [auth_root] + list(auth_root):
+                            xml_user = None
+                            xml_pass = None
+                            xml_acct = None
+                            for el in parent.iter():
+                                tag = el.tag.lower() if el.tag else ""
+                                if tag in ("username", "user", "remote_username"):
+                                    xml_user = (el.text or "").strip()
+                                elif tag in ("password", "pass", "remote_password"):
+                                    xml_pass = (el.text or "").strip()
+                                elif tag in ("account", "remote_account", "acctid"):
+                                    xml_acct = (el.text or "").strip()
+                            if xml_user == ACCIO_USERNAME and xml_pass == ACCIO_PASSWORD:
+                                auth_valid = True
+                                break
+                        # Also check root element attributes
+                        if not auth_valid:
+                            root_user = auth_root.get("username") or auth_root.get("user") or ""
+                            root_pass = auth_root.get("password") or auth_root.get("pass") or ""
+                            if root_user == ACCIO_USERNAME and root_pass == ACCIO_PASSWORD:
+                                auth_valid = True
+                    except ET.ParseError:
+                        pass
+                # Method 4: Check HTTP headers (some systems send custom headers)
+                if not auth_valid:
+                    h_user = self.headers.get("X-Username") or self.headers.get("Username") or ""
+                    h_pass = self.headers.get("X-Password") or self.headers.get("Password") or ""
+                    if h_user == ACCIO_USERNAME and h_pass == ACCIO_PASSWORD:
+                        auth_valid = True
+                # Log the auth attempt for debugging
+                logging.info(f"Accio push auth: valid={auth_valid}, has_basic={bool(auth_header)}, has_body={len(raw)>0}")
+                if not auth_valid:
+                    # Log the failed attempt with headers for debugging
+                    all_headers = {k: v for k, v in self.headers.items() if k.lower() != "authorization"}
+                    logging.warning(f"Auth failed. Headers: {all_headers}")
+                    db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status,error_message) VALUES ('inbound',?,'auth_failed','Authentication failed - check vendor credentials')", (raw[:10000],))
+                    db.commit()
                     self._send(401, '<?xml version="1.0" encoding="UTF-8"?>\n<XML><error>Authentication required</error></XML>', "text/xml")
                     return
-                length = int(self.headers.get("Content-Length", 0))
-                raw = self.rfile.read(length).decode()
                 db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status) VALUES ('inbound',?,'processing')", (raw[:10000],))
                 db.commit()
                 applicants_data, err = parse_accio_xml(raw)
@@ -1181,9 +1223,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/settings":
                 if isinstance(form_data, cgi.FieldStorage):
                     for key in DEFAULT_SETTINGS:
-                        val = form_data.getfirst(key)
-                        if val is not None:
-                            set_setting(db, key, val)
+                        # For checkboxes, getlist returns ["0","1"] when checked, ["0"] when unchecked
+                        vals = form_data.getlist(key)
+                        if vals:
+                            set_setting(db, key, vals[-1])
                     # Handle file upload
                     if "release_form_file" in form_data:
                         fi = form_data["release_form_file"]
@@ -1196,7 +1239,8 @@ class Handler(BaseHTTPRequestHandler):
                     for key in DEFAULT_SETTINGS:
                         vals = form_data.get(key)
                         if vals:
-                            set_setting(db, key, vals[0])
+                            # For checkboxes, take the LAST value (hidden="0" comes first, checkbox="1" comes second)
+                            set_setting(db, key, vals[-1])
                 flash("Settings saved.", "success")
                 self._redirect("/settings")
 
