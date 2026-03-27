@@ -560,7 +560,7 @@ tr:hover td{{background:var(--g50);}}
 .btn{{display:inline-flex;align-items:center;gap:5px;padding:7px 14px;border-radius:7px;font-size:12px;font-weight:500;border:none;cursor:pointer;text-decoration:none;transition:.15s;}}
 .btn-p{{background:var(--p);color:#fff;}}.btn-p:hover{{background:var(--pd);}}
 .btn-s{{background:var(--s);color:#fff;}}.btn-s:hover{{background:#15803d;}}
-.btn-w{{background:var(--w);color:#fff;}}.btn-o{{background:#fff;color:var(--g700);border:1px solid var(--g300);}}.btn-o:hover{{background:var(--g50);}}
+.btn-w{{background:var(--w);color:#fff;}}.btn-d{{background:#dc3545;color:#fff;}}.btn-d:hover{{background:#c82333;}}.btn-o{{background:#fff;color:var(--g700);border:1px solid var(--g300);}}.btn-o:hover{{background:var(--g50);}}
 .btn-sm{{padding:4px 9px;font-size:11px;}}
 .badge{{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:600;text-transform:uppercase;}}
 .b-pe{{background:#fef3c7;color:#92400e;}}.b-ca{{background:#dbeafe;color:#1e40af;}}.b-em{{background:#dcfce7;color:#166534;}}.b-av{{background:#dcfce7;color:#166534;}}.b-as{{background:#dbeafe;color:#1e40af;}}
@@ -714,6 +714,7 @@ def _applicant_table(rows, full=False):
             t += f'<form action="/applicants/{sid}/send-email" method="POST" style="display:inline"><button class="btn btn-sm btn-s" title="Send email"><i class="fas fa-envelope"></i></button></form>'
         elif a["status"] == "emailed":
             t += '<span style="color:var(--s);font-size:11px"><i class="fas fa-check"></i> Done</span>'
+        t += f' <form action="/applicants/{sid}/delete" method="POST" style="display:inline" onsubmit="return confirm(\'Delete this applicant?\')"><button class="btn btn-sm btn-d" title="Delete"><i class="fas fa-trash"></i></button></form>'
         t += '</div></td></tr>'
     t += '</tbody></table>'
     return t
@@ -975,11 +976,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             # Accio Data XML push endpoint
             if path == "/api/accio-push":
+              try:
                 ACCIO_USERNAME = os.environ.get("ACCIO_USERNAME", "admin")
                 ACCIO_PASSWORD = os.environ.get("ACCIO_PASSWORD", "Fingerprint")
                 # Read the body first (Accio may embed credentials in XML)
                 length = int(self.headers.get("Content-Length", 0))
-                raw = self.rfile.read(length).decode()
+                raw = self.rfile.read(length).decode() if length > 0 else ""
                 auth_valid = False
                 # Method 1: HTTP Basic Auth header
                 auth_header = self.headers.get("Authorization", "")
@@ -996,7 +998,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not auth_valid and qs.get("username", [None])[0] == ACCIO_USERNAME and qs.get("password", [None])[0] == ACCIO_PASSWORD:
                     auth_valid = True
                 # Method 3: Credentials in the XML body (Accio XML format)
-                if not auth_valid:
+                if not auth_valid and raw.strip():
                     try:
                         auth_root = ET.fromstring(raw)
                         # Check for account/username/password elements at various levels
@@ -1022,7 +1024,9 @@ class Handler(BaseHTTPRequestHandler):
                             if root_user == ACCIO_USERNAME and root_pass == ACCIO_PASSWORD:
                                 auth_valid = True
                     except ET.ParseError:
-                        pass
+                        logging.warning("XML parse error during auth check")
+                    except Exception as e:
+                        logging.warning(f"Unexpected error during XML auth check: {e}")
                 # Method 4: Check HTTP headers (some systems send custom headers)
                 if not auth_valid:
                     h_user = self.headers.get("X-Username") or self.headers.get("Username") or ""
@@ -1030,50 +1034,75 @@ class Handler(BaseHTTPRequestHandler):
                     if h_user == ACCIO_USERNAME and h_pass == ACCIO_PASSWORD:
                         auth_valid = True
                 # Log the auth attempt for debugging
-                logging.info(f"Accio push auth: valid={auth_valid}, has_basic={bool(auth_header)}, has_body={len(raw)>0}")
+                logging.info(f"Accio push auth: valid={auth_valid}, has_basic={bool(auth_header)}, has_body={len(raw)>0}, body_len={len(raw)}")
                 if not auth_valid:
                     # Log the failed attempt with headers for debugging
                     all_headers = {k: v for k, v in self.headers.items() if k.lower() != "authorization"}
                     logging.warning(f"Auth failed. Headers: {all_headers}")
+                    logging.warning(f"Auth failed. Body preview: {raw[:500]}")
                     db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status,error_message) VALUES ('inbound',?,'auth_failed','Authentication failed - check vendor credentials')", (raw[:10000],))
                     db.commit()
-                    self._send(401, '<?xml version="1.0" encoding="UTF-8"?>\n<XML><error>Authentication required</error></XML>', "text/xml")
+                    self._send(401, '<?xml version="1.0" encoding="UTF-8"?>\n<BackgroundReports><error>Authentication required</error></BackgroundReports>', "text/xml")
                     return
+                # Auth passed - log and process
+                logging.info(f"Accio push auth PASSED. Processing XML ({len(raw)} bytes)...")
                 db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status) VALUES ('inbound',?,'processing')", (raw[:10000],))
                 db.commit()
                 applicants_data, err = parse_accio_xml(raw)
                 if err:
+                    logging.error(f"XML parse error: {err}")
                     db.execute("UPDATE xml_log SET parsed_status='error',error_message=? WHERE id=(SELECT MAX(id) FROM xml_log)", (err,))
                     db.commit()
-                    self._send(400, '<?xml version="1.0" encoding="UTF-8"?>\n<XML><error>XML parse error</error></XML>', "text/xml")
+                    self._send(400, '<?xml version="1.0" encoding="UTF-8"?>\n<BackgroundReports><error>XML parse error</error></BackgroundReports>', "text/xml")
                     return
                 added = 0
                 auto_assign = get_setting(db, "auto_assign_codes") == "1"
                 auto_email = get_setting(db, "auto_send_email") == "1"
                 for a in applicants_data:
-                    ex = db.execute("SELECT id FROM applicants WHERE accio_order_number=?", (a["accio_order_number"],)).fetchone() if a["accio_order_number"] else None
-                    if not ex:
-                        db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number) VALUES (?,?,?,?,?,?)",
-                                   (a["first_name"],a["last_name"],a["email"],a["phone"],a["accio_order_number"],a["accio_remote_number"]))
-                        new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-                        added += 1
-                        # Auto-assign a payment code if enabled
-                        if auto_assign:
-                            code_row = db.execute("SELECT id, code FROM codes WHERE assigned_to IS NULL LIMIT 1").fetchone()
-                            if code_row:
-                                db.execute("UPDATE codes SET assigned_to=?, assigned_date=datetime('now') WHERE id=?", (new_id, code_row["id"]))
-                                db.execute("UPDATE applicants SET assigned_code=? WHERE id=?", (code_row["code"], new_id))
-                                db.commit()
-                                # Auto-send email if enabled
-                                if auto_email and a["email"]:
-                                    try:
-                                        send_release_email(db, new_id)
-                                    except Exception:
-                                        pass
-                db.execute("UPDATE xml_log SET parsed_status='success' WHERE id=(SELECT MAX(id) FROM xml_log)")
+                    try:
+                        ex = db.execute("SELECT id FROM applicants WHERE accio_order_number=?", (a["accio_order_number"],)).fetchone() if a["accio_order_number"] else None
+                        if not ex:
+                            db.execute("INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number) VALUES (?,?,?,?,?,?)",
+                                       (a["first_name"],a["last_name"],a["email"],a["phone"],a["accio_order_number"],a["accio_remote_number"]))
+                            new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                            added += 1
+                            # Auto-assign a payment code if enabled
+                            if auto_assign:
+                                code_row = db.execute("SELECT id, code FROM codes WHERE assigned_to IS NULL LIMIT 1").fetchone()
+                                if code_row:
+                                    db.execute("UPDATE codes SET assigned_to=?, assigned_date=datetime('now') WHERE id=?", (new_id, code_row["id"]))
+                                    db.execute("UPDATE applicants SET assigned_code=? WHERE id=?", (code_row["code"], new_id))
+                                    db.commit()
+                                    # Auto-send email if enabled
+                                    if auto_email and a["email"]:
+                                        try:
+                                            send_release_email(db, new_id)
+                                        except Exception as email_err:
+                                            logging.error(f"Auto-email failed for applicant {new_id}: {email_err}")
+                    except Exception as proc_err:
+                        logging.error(f"Error processing applicant: {proc_err}")
+                db.execute("UPDATE xml_log SET parsed_status='success',error_message=? WHERE id=(SELECT MAX(id) FROM xml_log)", (f"Added {added} applicants from {len(applicants_data)} parsed",))
                 db.commit()
-                # Respond with Accio-compatible XML (no <error> node = accepted)
-                self._send(200, '<?xml version="1.0" encoding="UTF-8"?>\n<XML></XML>', "text/xml")
+                logging.info(f"Accio push complete: {added} added from {len(applicants_data)} parsed")
+                # Respond with Accio-compatible XML acknowledgment
+                resp_xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
+                resp_xml += '<BackgroundReports>\n'
+                resp_xml += '  <BackgroundReportPackage>\n'
+                resp_xml += f'    <ScreeningStatus>accepted</ScreeningStatus>\n'
+                resp_xml += f'    <ResultsRetrieved>{added}</ResultsRetrieved>\n'
+                resp_xml += '  </BackgroundReportPackage>\n'
+                resp_xml += '</BackgroundReports>'
+                self._send(200, resp_xml, "text/xml")
+                return
+              except Exception as e:
+                # Catch-all: ALWAYS send a valid response so Accio doesn't get "unable to read response"
+                logging.error(f"CRITICAL: Unhandled exception in accio-push: {e}", exc_info=True)
+                try:
+                    db.execute("INSERT INTO xml_log (direction,raw_xml,parsed_status,error_message) VALUES ('inbound','','crash',?)", (str(e)[:5000],))
+                    db.commit()
+                except Exception:
+                    pass
+                self._send(500, '<?xml version="1.0" encoding="UTF-8"?>\n<BackgroundReports><error>Internal server error</error></BackgroundReports>', "text/xml")
                 return
 
             # API: Bulk code upload (JSON)
@@ -1167,6 +1196,17 @@ class Handler(BaseHTTPRequestHandler):
                     assign_code(db, aid)
                 ok, msg = send_release_email(db, aid)
                 flash("Code assigned & email sent!" if ok else f"Code assigned but email failed: {msg}", "success" if ok else "error")
+                self._redirect("/applicants")
+
+            elif path.startswith("/applicants/") and path.endswith("/delete"):
+                aid = int(path.split("/")[2])
+                # Free the assigned code back to the pool
+                applicant = db.execute("SELECT assigned_code FROM applicants WHERE id=?", (aid,)).fetchone()
+                if applicant and applicant["assigned_code"]:
+                    db.execute("UPDATE codes SET assigned_to=NULL, assigned_date=NULL WHERE code=?", (applicant["assigned_code"],))
+                db.execute("DELETE FROM applicants WHERE id=?", (aid,))
+                db.commit()
+                flash("Applicant deleted.", "success")
                 self._redirect("/applicants")
 
             elif path == "/applicants/bulk-process":
