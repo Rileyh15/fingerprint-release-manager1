@@ -1342,10 +1342,12 @@ def page_dashboard(db):
 
     # Recent activity
     activity = db.execute("""
-        SELECT 'new_applicant' as type, id, first_name, last_name, created_at FROM applicants
-        UNION ALL
-        SELECT 'email_sent' as type, id, recipient_email, subject, sent_at FROM email_log
-        ORDER BY COALESCE(created_at, sent_at) DESC
+        SELECT type, id, col1, col2, ts FROM (
+            SELECT 'new_applicant' as type, id, first_name as col1, last_name as col2, created_at as ts FROM applicants
+            UNION ALL
+            SELECT 'email_sent' as type, id, recipient_email as col1, subject as col2, sent_at as ts FROM email_log
+        ) combined
+        ORDER BY ts DESC NULLS LAST
         LIMIT 10
     """).fetchall()
 
@@ -1438,16 +1440,16 @@ def page_dashboard(db):
             activity_html += f"""
                 <tr>
                     <td><span class="status-badge status-pending">New</span></td>
-                    <td>{h(a['first_name'])} {h(a['last_name'])}</td>
-                    <td>{fmt_dt(a['created_at'])}</td>
+                    <td>{h(a['col1'])} {h(a['col2'])}</td>
+                    <td>{fmt_dt(a['ts'])}</td>
                 </tr>
             """
         elif a["type"] == "email_sent":
             activity_html += f"""
                 <tr>
                     <td><span class="status-badge status-emailed">Email</span></td>
-                    <td>{h(a['recipient_email'] or '-')} - {h(a['subject'] or '-')}</td>
-                    <td>{fmt_dt(a['sent_at'])}</td>
+                    <td>{h(a['col1'] or '-')} - {h(a['col2'] or '-')}</td>
+                    <td>{fmt_dt(a['ts'])}</td>
                 </tr>
             """
     activity_html += """
