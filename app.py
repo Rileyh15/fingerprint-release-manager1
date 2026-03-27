@@ -1,4 +1,3 @@
-
 """
 Fingerprint Release Manager
 Integrates with Accio Data XML API to automate fingerprint release form distribution.
