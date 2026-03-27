@@ -291,26 +291,82 @@ def parse_accio_xml(xml_string):
                                        phone=phone, accio_order_number="",
                                        accio_remote_number=""))
 
-    # --- Format 5: AccioOrder XML format ---
+    # --- Format 5: AccioOrder XML format (placeOrder > subject) ---
+    # Accio sends: <AccioOrder><placeOrder number="..."><orderInfo><requester_email>...
+    #              <subject><name_first>...<name_last>... (NO email/phone in subject!)
+    # Email and phone are in <orderInfo> or <clientInfo> siblings, not in <subject>
     if not applicants:
-        for order in root.iter("order"):
-            order_number = order.get("number", "")
-            remote_number = order.get("remote_order", "")
-            for subject in order.iter("subject"):
+        for place_order in root.iter("placeOrder"):
+            order_number = place_order.get("number", "")
+            # Get email/phone from orderInfo (sibling of subject within placeOrder)
+            order_info = place_order.find("orderInfo")
+            order_email = ""
+            order_phone = ""
+            if order_info is not None:
+                order_email = (_xt(order_info, "requester_email") or
+                              _xt(order_info, "requester_fax") or "")
+                order_phone = (_xt(order_info, "requester_phone") or "")
+            # Fallback: try clientInfo or accountInfo
+            if not order_email:
+                client_info = place_order.find("clientInfo")
+                if client_info is not None:
+                    order_email = _xt(client_info, "primaryuser_contact_email")
+                    if not order_phone:
+                        order_phone = _xt(client_info, "primaryuser_contact_telephone")
+            if not order_email:
+                account_info = place_order.find("accountInfo")
+                if account_info is not None:
+                    order_email = _xt(account_info, "primaryuser_contact_email")
+                    if not order_phone:
+                        order_phone = _xt(account_info, "primaryuser_contact_telephone")
+            for subject in place_order.iter("subject"):
                 first = _xt(subject, "name_first")
                 last = _xt(subject, "name_last")
-                # Try multiple email tag variations
+                # Check subject first for email/phone (in case future XML includes them)
                 email = (_xt(subject, "email") or _xt(subject, "Email") or
                         _xt(subject, "InternetEmailAddress") or _xt(subject, "email_address") or
                         _xt(subject, "EmailAddress") or _xt(subject, "e_mail") or
                         _xt(subject, "applicant_email") or _xt(subject, "candidate_email") or
                         _xt(subject, "contact_email"))
-                # Try multiple phone tag variations
                 phone = (_xt(subject, "phone") or _xt(subject, "Phone") or
                         _xt(subject, "phone_number") or _xt(subject, "PhoneNumber") or
                         _xt(subject, "FormattedNumber") or _xt(subject, "telephone") or
                         _xt(subject, "contact_phone") or _xt(subject, "home_phone") or
                         _xt(subject, "cell_phone") or _xt(subject, "mobile"))
+                # If not found in subject, use orderInfo values
+                if not email:
+                    email = order_email
+                if not phone:
+                    phone = order_phone
+                if first or last:
+                    applicants.append(dict(first_name=first, last_name=last, email=email,
+                                           phone=phone, accio_order_number=order_number,
+                                           accio_remote_number=""))
+
+    # --- Format 5b: Also try <order> tag (older AccioOrder variants) ---
+    if not applicants:
+        for order in root.iter("order"):
+            order_number = order.get("number", "")
+            remote_number = order.get("remote_order", "")
+            order_info = order.find("orderInfo")
+            order_email = ""
+            order_phone = ""
+            if order_info is not None:
+                order_email = _xt(order_info, "requester_email")
+                order_phone = _xt(order_info, "requester_phone")
+            for subject in order.iter("subject"):
+                first = _xt(subject, "name_first")
+                last = _xt(subject, "name_last")
+                email = (_xt(subject, "email") or _xt(subject, "Email") or
+                        _xt(subject, "InternetEmailAddress") or _xt(subject, "email_address") or
+                        _xt(subject, "contact_email"))
+                phone = (_xt(subject, "phone") or _xt(subject, "Phone") or
+                        _xt(subject, "phone_number") or _xt(subject, "FormattedNumber") or
+                        _xt(subject, "contact_phone"))
+                if not email:
+                    email = order_email
+                if not phone:
+                    phone = order_phone
                 if first or last:
                     applicants.append(dict(first_name=first, last_name=last, email=email,
                                            phone=phone, accio_order_number=order_number,
