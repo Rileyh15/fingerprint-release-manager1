@@ -1632,6 +1632,7 @@ def page_codes(db, params):
                     <th>Batch</th>
                     <th>Assigned To</th>
                     <th>Date</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
@@ -1644,6 +1645,14 @@ def page_codes(db, params):
             if a:
                 assigned_to = f"{h(a['first_name'])} {h(a['last_name'])}"
 
+        delete_btn = ""
+        if not r["assigned_to"]:
+            delete_btn = f"""<form method="POST" action="/codes/{r['id']}/delete" style="display:inline;" onsubmit="return confirm('Delete this code?')">
+                <button type="submit" class="btn btn-small" style="padding:4px 8px; font-size:0.75rem; background:#dc3545; color:white; border:none; border-radius:4px;" title="Delete code"><i class="fas fa-trash"></i></button>
+            </form>"""
+        else:
+            delete_btn = '<span style="color:#999; font-size:0.8rem;">In use</span>'
+
         content += f"""
                 <tr>
                     <td><code>{h(r['code'])}</code></td>
@@ -1651,6 +1660,7 @@ def page_codes(db, params):
                     <td>{h(r['batch_name'] or '-')}</td>
                     <td>{assigned_to}</td>
                     <td>{fmt_dt(r['imported_at'])}</td>
+                    <td>{delete_btn}</td>
                 </tr>
         """
 
@@ -2387,6 +2397,19 @@ class Handler(BaseHTTPRequestHandler):
                         fail += 1; break
                 flash(f"Done: {succ} sent, {fail} failed.", "success")
                 self._redirect("/applicants")
+
+            elif path.startswith("/codes/") and path.endswith("/delete"):
+                code_id = int(path.split("/")[2])
+                code_row = db.execute("SELECT * FROM codes WHERE id = %s", (code_id,)).fetchone()
+                if not code_row:
+                    flash("Code not found.", "error")
+                elif code_row["assigned_to"]:
+                    flash("Cannot delete a code that is already assigned to an applicant.", "error")
+                else:
+                    db.execute("DELETE FROM codes WHERE id = %s", (code_id,))
+                    db.commit()
+                    flash(f"Code '{code_row['code']}' deleted.", "success")
+                self._redirect("/codes")
 
             elif path == "/codes/add-manual":
                 codes_text = fv("codes")
