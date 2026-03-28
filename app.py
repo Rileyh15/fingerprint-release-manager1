@@ -26,6 +26,7 @@ import json
 import smtplib
 import logging
 import urllib.parse
+import urllib.request
 import cgi
 import io
 import csv
@@ -224,6 +225,16 @@ def init_db():
     except psycopg2.Error:
         pass  # Column already exists
 
+    # New columns to capture Accio sub-order number and order type for postback
+    try:
+        db.execute("ALTER TABLE applicants ADD COLUMN accio_sub_order TEXT")
+    except psycopg2.Error:
+        pass  # Column already exists
+    try:
+        db.execute("ALTER TABLE applicants ADD COLUMN accio_order_type TEXT")
+    except psycopg2.Error:
+        pass  # Column already exists
+
     db.close()
 
     # Create default admin user if no users exist
@@ -251,6 +262,7 @@ DEFAULT_SETTINGS = {
     "accio_username": os.environ.get("ACCIO_USERNAME", "admin"),
     "accio_password": os.environ.get("ACCIO_PASSWORD", "Fingerprint"),
     "accio_post_url": os.environ.get("ACCIO_POST_URL", "https://fingerprint-release-manager1.onrender.com/api/accio-push"),
+    "accio_researcher_url": os.environ.get("ACCIO_RESEARCHER_URL", ""),
     "smtp_server": os.environ.get("SMTP_HOST", "smtp.gmail.com"),
     "smtp_port": os.environ.get("SMTP_PORT", "587"),
     "smtp_username": os.environ.get("SMTP_USER", ""),
@@ -379,6 +391,10 @@ def parse_accio_xml(xml_string):
     for complete_order in root.iter("completeOrder"):
         order_number = complete_order.get("number", "")
         remote_number = complete_order.get("remote_number", "")
+        # Capture sub-order ID and type for Accio postback (Ch 9)
+        sub_order_el = complete_order.find("subOrder")
+        sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
+        order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
         for subject in complete_order.iter("subject"):
             first = _xt(subject, "name_first")
             last = _xt(subject, "name_last")
@@ -387,7 +403,8 @@ def parse_accio_xml(xml_string):
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
-                                       accio_remote_number=remote_number, company_name=""))
+                                       accio_remote_number=remote_number, company_name="",
+                                       accio_sub_order=sub_order_id, accio_order_type=order_type))
 
     for po in root.iter("placeOrder"):
         company_name = ""
@@ -415,6 +432,9 @@ def parse_accio_xml(xml_string):
                 oi_email = _xt(ai, "primaryuser_contact_email")
                 if not oi_phone:
                     oi_phone = _xt(ai, "primaryuser_contact_telephone")
+        sub_order_el = po.find("subOrder")
+        sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
+        order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
         for subject in po.iter("subject"):
             first = _xt(subject, "name_first")
             last = _xt(subject, "name_last")
@@ -424,12 +444,16 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=po.get("number", ""),
                                        accio_remote_number="", company_name=company_name,
-                                       account_name=account_name))
+                                       account_name=account_name,
+                                       accio_sub_order=sub_order_id, accio_order_type=order_type))
 
     # --- Format 2: Action Letter XML Post (postLetter with orderInfo) ---
     for post_letter in root.iter("postLetter"):
         order_number = post_letter.get("remote_order", "") or post_letter.get("order", "")
         remote_order = post_letter.get("remote_order", "")
+        sub_order_el = post_letter.find("subOrder")
+        sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
+        order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
         order_info = post_letter.find("orderInfo")
         if order_info is not None:
             first = _xt(order_info, "name_first")
@@ -444,12 +468,16 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_order, company_name="",
-                                       account_name=""))
+                                       account_name="",
+                                       accio_sub_order=sub_order_id, accio_order_type=order_type))
 
     # --- Format 3: Vendor dispatch XML (orderRequest with subject) ---
     for order_req in root.iter("orderRequest"):
         order_number = order_req.get("order", "") or order_req.get("number", "")
         remote_number = order_req.get("remote_order", "")
+        sub_order_el = order_req.find("subOrder")
+        sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
+        order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
         for subject in order_req.iter("subject"):
             first = _xt(subject, "name_first") or _xt(subject, "firstName")
             last = _xt(subject, "name_last") or _xt(subject, "lastName")
@@ -459,7 +487,8 @@ def parse_accio_xml(xml_string):
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_number, company_name="",
-                                       account_name=""))
+                                       account_name="",
+                                       accio_sub_order=sub_order_id, accio_order_type=order_type))
 
     # --- Format 4: Generic fallback - PersonalData or BackgroundSearchPackage ---
     if not applicants:
@@ -507,6 +536,9 @@ def parse_accio_xml(xml_string):
                     order_email = _xt(ai, "primaryuser_contact_email")
                     if not order_phone:
                         order_phone = _xt(ai, "primaryuser_contact_telephone")
+            sub_order_el = place_order.find("subOrder")
+            sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
+            order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
             for subject in place_order.iter("subject"):
                 first = _xt(subject, "name_first")
                 last = _xt(subject, "name_last")
@@ -528,7 +560,8 @@ def parse_accio_xml(xml_string):
                     applicants.append(dict(first_name=first, last_name=last, email=email,
                                            phone=phone, accio_order_number=order_number,
                                            accio_remote_number="", company_name=company_name,
-                                           account_name=account_name))
+                                           account_name=account_name,
+                                           accio_sub_order=sub_order_id, accio_order_type=order_type))
 
     # --- Format 5b: <order> tag (older AccioOrder variants) ---
     if not applicants:
@@ -540,6 +573,9 @@ def parse_accio_xml(xml_string):
             if order_info is not None:
                 order_email = _xt(order_info, "requester_email")
                 order_phone = _xt(order_info, "requester_phone")
+            sub_order_el = order.find("subOrder")
+            sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
+            order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
             for subject in order.iter("subject"):
                 first = _xt(subject, "name_first")
                 last = _xt(subject, "name_last")
@@ -557,7 +593,8 @@ def parse_accio_xml(xml_string):
                     applicants.append(dict(first_name=first, last_name=last, email=email,
                                            phone=phone, accio_order_number=order_number,
                                            accio_remote_number=remote_number, company_name="",
-                                           account_name=""))
+                                           account_name="",
+                                           accio_sub_order=sub_order_id, accio_order_type=order_type))
 
     # --- Deep scan fallback ---
     if not applicants:
@@ -701,6 +738,18 @@ def send_release_email(db, applicant_id):
             (now, now, applicant_id)
         )
         db.commit()
+
+        # Post status note back to Accio (Ch 9 / Ch 11) — non-blocking: failure does
+        # not abort the email success response.  Silently skipped if URL not configured.
+        try:
+            pb_ok, pb_msg = post_accio_result(db, applicant_id)
+            if pb_ok:
+                logger.info(f"Accio postback: {pb_msg}")
+            else:
+                logger.warning(f"Accio postback skipped/failed (non-fatal): {pb_msg}")
+        except Exception as pb_exc:
+            logger.error(f"Accio postback exception (non-fatal): {pb_exc}")
+
         return True, "Email sent"
     except Exception as e:
         logger.error(f"SMTP FAILED: {type(e).__name__}: {e}")
@@ -709,6 +758,104 @@ def send_release_email(db, applicant_id):
             (applicant_id, a["email"], subj, str(e))
         )
         db.commit()
+        return False, str(e)
+
+
+def post_accio_result(db, applicant_id):
+    """Post a status note back to Accio's researcherxml endpoint.
+
+    Implements Ch 9 (postResults block) and Ch 11 (notes_from_vendor_to_screeningfirm)
+    of the Accio Data XML Integration Manual.  Sends filledStatus='filled' so Accio
+    marks the order complete and moves it to the next queue, with the assigned code
+    and a note visible to the screening firm.
+    """
+    a = db.execute("SELECT * FROM applicants WHERE id = %s", (applicant_id,)).fetchone()
+    if not a:
+        return False, "Applicant not found"
+
+    researcher_url = get_setting(db, "accio_researcher_url").strip()
+    if not researcher_url:
+        # Silently skip — feature disabled when URL not configured
+        return False, "Accio researcher URL not configured (skipped)"
+
+    order_number = (a.get("accio_order_number") or "").strip()
+    if not order_number:
+        return False, "No Accio order number on record — postback skipped"
+
+    accio_account  = get_setting(db, "accio_account")  or ""
+    accio_username = get_setting(db, "accio_username") or ""
+    accio_password = get_setting(db, "accio_password") or ""
+    sub_order      = (a.get("accio_sub_order")  or "1").strip() or "1"
+    order_type     = (a.get("accio_order_type") or "Fingerprint").strip() or "Fingerprint"
+    assigned_code  = (a.get("assigned_code") or "").strip()
+
+    sent_at = datetime.now().strftime("%m/%d/%Y %I:%M %p")
+    note_text = (
+        f"FP Release email sent on {sent_at}. "
+        f"Assigned fingerprint code: {assigned_code}"
+    )
+
+    # Build postResults XML per Ch 9 / Ch 11 of Accio Data XML Integration Manual.
+    # filledStatus='filled' — marks order complete, moves it to next queue in Accio.
+    # filledCode='see comments' — "Search completed with additional comments" (Ch 9.4.1).
+    # <notes_from_vendor_to_screeningfirm> — visible to screening firm, not end user (Ch 11).
+    xml_body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ScreeningResults>\n'
+        '  <mode>PROD</mode>\n'
+        '  <login>\n'
+        f'    <account>{h(accio_account)}</account>\n'
+        f'    <username>{h(accio_username)}</username>\n'
+        f'    <password>{h(accio_password)}</password>\n'
+        '  </login>\n'
+        f'  <postResults order=\'{h(order_number)}\' subOrder=\'{h(sub_order)}\'\n'
+        f'               type=\'{h(order_type)}\'\n'
+        "               filledStatus='filled'\n"
+        "               filledCode='see comments'>\n"
+        f'    <notes_from_vendor_to_screeningfirm>{h(note_text)}</notes_from_vendor_to_screeningfirm>\n'
+        f'    <text>{h(note_text)}</text>\n'
+        '  </postResults>\n'
+        '</ScreeningResults>\n'
+    )
+
+    try:
+        req = urllib.request.Request(
+            researcher_url,
+            data=xml_body.encode("utf-8"),
+            headers={"Content-Type": "text/xml; charset=utf-8"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            response_body = resp.read().decode("utf-8", errors="replace")
+
+        # Per Ch 9.2: no <error> node means success; presence of <error> is a failure
+        if "<error" in response_body.lower():
+            db.execute(
+                "INSERT INTO xml_log (direction, raw_xml, parsed_status, error_message) VALUES (%s,%s,%s,%s)",
+                ("postback", xml_body[:4000], "error", response_body[:500])
+            )
+            db.commit()
+            logger.warning(f"Accio postback rejected for order {order_number}: {response_body[:200]}")
+            return False, f"Accio rejected postback: {response_body[:200]}"
+
+        db.execute(
+            "INSERT INTO xml_log (direction, raw_xml, parsed_status) VALUES (%s,%s,%s)",
+            ("postback", xml_body[:4000], "success")
+        )
+        db.commit()
+        logger.info(f"Accio postback success for order {order_number} (code: {assigned_code})")
+        return True, "Accio notified"
+
+    except Exception as e:
+        logger.error(f"Accio postback failed for order {order_number}: {type(e).__name__}: {e}")
+        try:
+            db.execute(
+                "INSERT INTO xml_log (direction, raw_xml, parsed_status, error_message) VALUES (%s,%s,%s,%s)",
+                ("postback", xml_body[:4000], "failed", str(e)[:500])
+            )
+            db.commit()
+        except Exception:
+            pass
         return False, str(e)
 
 
@@ -1300,8 +1447,32 @@ def page_settings(db):
     sender_name_val = h(get_setting(db, "sender_name"))
     email_subj_val = h(get_setting(db, "email_subject"))
     email_body_val = h(get_setting(db, "email_body"))
+    accio_account_val = h(get_setting(db, "accio_account"))
+    accio_username_val = h(get_setting(db, "accio_username"))
+    accio_password_val = h(get_setting(db, "accio_password"))
+    accio_researcher_url_val = h(get_setting(db, "accio_researcher_url"))
 
     content = f"""
+    <div class="card">
+        <div class="card-title"><i class="fas fa-exchange-alt"></i> Accio Postback Configuration</div>
+        <form method="POST" action="/settings">
+            <p style="color: var(--gray-500); font-size: 0.875rem; margin-bottom: 1rem;">
+                When an FP Release email is sent, the app will automatically post a status note
+                back to Accio (Chapter 9 &amp; 11 of the XML Integration Manual) so the screening
+                firm can see the email was sent and the assigned code.
+                Leave <strong>Researcher URL</strong> blank to disable postback.
+            </p>
+            <div class="grid-2">
+                <div class="form-group"><label for="accio_account">Accio Account</label><input type="text" id="accio_account" name="accio_account" value="{accio_account_val}"></div>
+                <div class="form-group"><label for="accio_username">Accio Username</label><input type="text" id="accio_username" name="accio_username" value="{accio_username_val}"></div>
+            </div>
+            <div class="grid-2">
+                <div class="form-group"><label for="accio_password">Accio Password</label><input type="password" id="accio_password" name="accio_password" value="{accio_password_val}"></div>
+                <div class="form-group"><label for="accio_researcher_url">Researcher XML URL</label><input type="url" id="accio_researcher_url" name="accio_researcher_url" value="{accio_researcher_url_val}" placeholder="https://yourcompany.acciodata.com/c/p/researcherxml"></div>
+            </div>
+            <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Accio Settings</button>
+        </form>
+    </div>
     <div class="card">
         <div class="card-title"><i class="fas fa-cog"></i> SMTP Configuration</div>
         <form method="POST" action="/settings">
@@ -1776,10 +1947,11 @@ class Handler(BaseHTTPRequestHandler):
                                         client_id = client["id"]
 
                                 cur = db.execute(
-                                    "INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number,client_id) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                                    "INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number,client_id,accio_sub_order,accio_order_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                                     (a["first_name"], a["last_name"], a.get("email", ""),
                                      a.get("phone", ""), a.get("accio_order_number", ""),
-                                     a.get("accio_remote_number", ""), client_id)
+                                     a.get("accio_remote_number", ""), client_id,
+                                     a.get("accio_sub_order", "1"), a.get("accio_order_type", "Fingerprint"))
                                 )
                                 new_id = cur.fetchone()["id"]
                                 added += 1
