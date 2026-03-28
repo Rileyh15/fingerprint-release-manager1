@@ -2366,6 +2366,9 @@ class Handler(BaseHTTPRequestHandler):
                 applicant = db.execute("SELECT assigned_code FROM applicants WHERE id = %s", (aid,)).fetchone()
                 if applicant and applicant["assigned_code"]:
                     db.execute("UPDATE codes SET assigned_to=NULL, assigned_date=NULL WHERE code = %s", (applicant["assigned_code"],))
+                # Delete related records first (foreign key constraints)
+                db.execute("DELETE FROM email_tracking WHERE applicant_id = %s", (aid,))
+                db.execute("DELETE FROM email_log WHERE applicant_id = %s", (aid,))
                 db.execute("DELETE FROM applicants WHERE id = %s", (aid,))
                 db.commit()
                 flash("Applicant deleted.", "success")
