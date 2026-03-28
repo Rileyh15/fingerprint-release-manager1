@@ -226,7 +226,22 @@ def init_db():
         )
     """)
 
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            token TEXT UNIQUE NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            used BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
     # Add new columns to existing tables if they don't exist
+    try:
+        db.execute("ALTER TABLE users ADD COLUMN recovery_email TEXT")
+    except psycopg2.Error:
+        pass  # Column already exists
     try:
         db.execute("ALTER TABLE applicants ADD COLUMN client_id INTEGER REFERENCES clients(id)")
     except psycopg2.Error:
@@ -1195,6 +1210,8 @@ def render_page(title, content, active="", user=None):
                     <li><a href="/codes" class="{'active' if active == 'codes' else ''}"><i class="fas fa-barcode"></i> Codes</a></li>
                     <li><a href="/settings" class="{'active' if active == 'settings' else ''}"><i class="fas fa-cog"></i> Settings</a></li>
                     <li><a href="/logs" class="{'active' if active == 'logs' else ''}"><i class="fas fa-file-alt"></i> Logs</a></li>
+                    {'<li><a href="/users" class="' + ("active" if active == "users" else "") + '"><i class="fas fa-users-cog"></i> Users</a></li>' if user and user.get("role") == "admin" else ""}
+                    <li><a href="/profile" class="{'active' if active == 'profile' else ''}"><i class="fas fa-user-circle"></i> My Account</a></li>
                 </nav>
             </div>
             <div class="main">
@@ -1266,13 +1283,16 @@ def page_login(error=""):
                 </div>
                 <button type="submit" class="btn">Sign In</button>
             </form>
+            <p style="text-align:center;margin-top:1.25rem;font-size:.875rem;">
+                <a href="/forgot-password" style="color:var(--primary);text-decoration:none;">Forgot password?</a>
+            </p>
         </div>
     </body>
     </html>
     """
 
 
-def page_dashboard(db):
+def page_dashboard(db, nav_user=None):
     """Dashboard with analytics."""
     total_app = db.execute("SELECT COUNT(*) as cnt FROM applicants").fetchone()["cnt"]
     pending = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='pending'").fetchone()["cnt"]
@@ -1323,10 +1343,10 @@ def page_dashboard(db):
             activity_html += f'<tr><td><span class="status-badge status-emailed">Email</span></td><td>{h(a["col1"] or "-")} - {h(a["col2"] or "-")}</td><td>{fmt_dt(a["ts"])}</td></tr>'
     activity_html += "</tbody></table></div>"
 
-    return render_page("Dashboard", stats_html + clients_html + activity_html, active="dashboard")
+    return render_page("Dashboard", stats_html + clients_html + activity_html, active="dashboard", user=nav_user)
 
 
-def page_applicants(db, params):
+def page_applicants(db, params, nav_user=None):
     """List and manage applicants."""
     search = (params.get("search", [None])[0] or "").lower()
     rows = db.execute("SELECT * FROM applicants ORDER BY created_at DESC").fetchall()
@@ -1394,10 +1414,10 @@ def page_applicants(db, params):
         """
 
     content += "</tbody></table></div>"
-    return render_page("Applicants", content, active="applicants")
+    return render_page("Applicants", content, active="applicants", user=nav_user)
 
 
-def page_add_applicant():
+def page_add_applicant(nav_user=None):
     content = """
     <div class="card">
         <form method="POST" action="/applicants/add">
@@ -1416,10 +1436,10 @@ def page_add_applicant():
         </form>
     </div>
     """
-    return render_page("Add Applicant", content, active="applicants")
+    return render_page("Add Applicant", content, active="applicants", user=nav_user)
 
 
-def page_codes(db, params):
+def page_codes(db, params, nav_user=None):
     avail = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NULL").fetchone()["cnt"]
     assigned = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NOT NULL").fetchone()["cnt"]
     rows = db.execute("SELECT * FROM codes ORDER BY imported_at DESC LIMIT 100").fetchall()
@@ -1469,10 +1489,10 @@ def page_codes(db, params):
         """
 
     content += "</tbody></table></div>"
-    return render_page("Payment Codes", content, active="codes")
+    return render_page("Payment Codes", content, active="codes", user=nav_user)
 
 
-def page_import_codes():
+def page_import_codes(nav_user=None):
     content = """
     <div class="card">
         <form method="POST" action="/codes/import" enctype="multipart/form-data">
@@ -1485,10 +1505,10 @@ def page_import_codes():
         </form>
     </div>
     """
-    return render_page("Import Payment Codes", content, active="codes")
+    return render_page("Import Payment Codes", content, active="codes", user=nav_user)
 
 
-def page_settings(db):
+def page_settings(db, nav_user=None):
     # FIX: Replaced positional .format() on a template with explicit named variables
     # to prevent KeyError crashes if setting values contain curly braces
     smtp_server_val = h(get_setting(db, "smtp_server"))
@@ -1560,10 +1580,10 @@ def page_settings(db):
         </form>
     </div>
     """
-    return render_page("Settings", content, active="settings")
+    return render_page("Settings", content, active="settings", user=nav_user)
 
 
-def page_logs(db):
+def page_logs(db, nav_user=None):
     xml_rows = db.execute("SELECT * FROM xml_log ORDER BY id DESC LIMIT 50").fetchall()
     email_rows = db.execute("SELECT * FROM email_log ORDER BY id DESC LIMIT 50").fetchall()
 
@@ -1579,10 +1599,10 @@ def page_logs(db):
         email_html += f"<tr><td>{r['id']}</td><td>{h(r['recipient_email'] or '-')}</td><td>{h((r['subject'] or '')[:40])}</td><td>{h(r['status'] or '-')}</td><td>{h((r['error_message'] or '')[:40])}</td><td>{fmt_dt(r['sent_at'])}</td></tr>"
     email_html += "</tbody></table></div>"
 
-    return render_page("Logs", xml_html + email_html, active="logs")
+    return render_page("Logs", xml_html + email_html, active="logs", user=nav_user)
 
 
-def page_clients(db, params):
+def page_clients(db, params, nav_user=None):
     # FIX: Wrapped int(client_id) in try/except to prevent ValueError 500 crash
     client_id_raw = params.get("client_id", [None])[0]
     client_id = None
@@ -1592,14 +1612,14 @@ def page_clients(db, params):
         except (ValueError, TypeError):
             return render_page("Invalid Request",
                                '<div class="es"><i class="fas fa-exclamation-triangle"></i><h3>Invalid client ID</h3></div>',
-                               active="clients")
+                               active="clients", user=nav_user)
 
     if client_id:
         client = db.execute("SELECT * FROM clients WHERE id = %s", (client_id,)).fetchone()
         if not client:
             return render_page("Not Found",
                                '<div class="es"><i class="fas fa-exclamation-triangle"></i><h3>Client not found</h3></div>',
-                               active="clients")
+                               active="clients", user=nav_user)
 
         applicants = db.execute(
             "SELECT * FROM applicants WHERE client_id = %s ORDER BY created_at DESC",
@@ -1635,7 +1655,287 @@ def page_clients(db, params):
             content += f'<tr><td>{h(c["company_name"])}</td><td>{h(c["account_name"] or "-")}</td><td>{h(c["contact_email"] or "-")}</td><td>{c["app_count"]}</td><td>{fmt_dt(c["last_order"])}</td><td><a href="/clients?client_id={c["id"]}" class="btn btn-primary btn-small">View</a></td></tr>'
         content += "</tbody></table></div>"
 
-    return render_page("Clients", content, active="clients")
+    return render_page("Clients", content, active="clients", user=nav_user)
+
+
+# ---------------------------------------------------------------------------
+# Password Reset
+# ---------------------------------------------------------------------------
+def send_password_reset_email(db, username_or_email):
+    """Look up user by username or recovery_email, send a reset link."""
+    user = db.execute(
+        "SELECT * FROM users WHERE (username=%s OR recovery_email=%s) AND is_active=TRUE LIMIT 1",
+        (username_or_email, username_or_email)
+    ).fetchone()
+    if not user:
+        # Do not reveal whether the account exists
+        return True, "If a matching account is found, a reset email will be sent."
+
+    recovery_addr = (user.get("recovery_email") or "").strip()
+    if not recovery_addr:
+        return False, "No recovery email is configured for this account. Contact an administrator."
+
+    token = str(uuid.uuid4())
+    expires_at = (datetime.now() + timedelta(hours=2)).isoformat()
+    db.execute(
+        "INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES (%s, %s, %s)",
+        (user["id"], token, expires_at)
+    )
+
+    smtp_server = get_setting(db, "smtp_server")
+    smtp_port = int(get_setting(db, "smtp_port") or 587)
+    smtp_user = get_setting(db, "smtp_username")
+    smtp_pass = get_setting(db, "smtp_password")
+    use_tls = get_setting(db, "smtp_use_tls") == "1"
+    sender_email = get_setting(db, "sender_email")
+    sender_name = get_setting(db, "sender_name") or "Fingerprint Release Manager"
+
+    base_url = (get_setting(db, "accio_post_url") or "").rstrip("/").rsplit("/api/", 1)[0] or "http://localhost:5000"
+    reset_link = f"{base_url}/reset-password?token={token}"
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["From"] = f"{sender_name} <{sender_email}>"
+        msg["To"] = recovery_addr
+        msg["Subject"] = "Password Reset – Fingerprint Release Manager"
+        plain = (f"Hi {user['display_name'] or user['username']},\n\n"
+                 f"A password reset was requested for your account.\n\n"
+                 f"Click the link below to reset your password (valid for 2 hours):\n{reset_link}\n\n"
+                 f"If you did not request this, you can safely ignore this email.\n\n"
+                 f"— Fingerprint Release Manager")
+        html_body = f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="font-family:Arial,sans-serif;color:#333;max-width:500px;margin:0 auto;">
+<h2 style="color:#2563eb;">Password Reset</h2>
+<p>Hi <strong>{h(user['display_name'] or user['username'])}</strong>,</p>
+<p>A password reset was requested for your account. Click the button below to set a new password.
+This link is valid for <strong>2 hours</strong>.</p>
+<p style="text-align:center;margin:2rem 0;">
+  <a href="{h(reset_link)}" style="background:#2563eb;color:white;padding:0.75rem 2rem;
+     border-radius:0.375rem;text-decoration:none;font-weight:600;">Reset Password</a>
+</p>
+<p style="color:#666;font-size:0.875rem;">Or copy this link into your browser:<br>
+<code style="word-break:break-all;">{h(reset_link)}</code></p>
+<p style="color:#666;font-size:0.875rem;">If you did not request this, you can safely ignore this email.</p>
+</body></html>"""
+        msg.attach(MIMEText(plain, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+        srv = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
+        if use_tls:
+            srv.starttls()
+        if smtp_user and smtp_pass:
+            srv.login(smtp_user, smtp_pass)
+        srv.send_message(msg)
+        srv.quit()
+        logger.info(f"Password reset email sent to {recovery_addr} for user {user['username']}")
+        return True, "Reset email sent. Check your inbox."
+    except Exception as e:
+        logger.error(f"Password reset email failed: {e}")
+        return False, f"Could not send email: {e}"
+
+
+def page_forgot_password(error="", success=""):
+    error_html = f'<div class="alert" style="background:rgba(239,68,68,0.1);border:1px solid #ef4444;color:#ef4444;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(error)}</div>' if error else ""
+    success_html = f'<div class="alert" style="background:rgba(16,185,129,0.1);border:1px solid #10b981;color:#10b981;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(success)}</div>' if success else ""
+    return f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Forgot Password – Fingerprint Release Manager</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<style>
+:root{{--primary:#2563eb;--gray-50:#f9fafb;--gray-200:#e5e7eb;--gray-400:#9ca3af;--gray-700:#374151;--gray-900:#111827;}}
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,var(--primary) 0%,#1e40af 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
+.card{{background:white;border-radius:.5rem;box-shadow:0 10px 25px rgba(0,0,0,.2);padding:3rem;width:100%;max-width:400px;}}
+.brand{{text-align:center;margin-bottom:2rem;}}
+.brand i{{font-size:3rem;color:var(--primary);margin-bottom:.5rem;}}
+.brand h1{{font-size:1.5rem;color:var(--gray-900);margin:0;}}
+.brand p{{color:var(--gray-400);margin:.5rem 0 0;font-size:.875rem;}}
+.fg{{margin-bottom:1.5rem;}}
+label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--gray-700);}}
+input{{width:100%;padding:.75rem;border:1px solid var(--gray-200);border-radius:.375rem;font-size:.875rem;font-family:inherit;}}
+input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1);}}
+.btn{{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.375rem;font-size:.875rem;font-weight:500;cursor:pointer;transition:background .2s;}}
+.btn:hover{{background:#1e40af;}}
+.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;}}
+</style></head><body>
+<div class="card">
+  <div class="brand"><i class="fas fa-fingerprint"></i><h1>Forgot Password</h1><p>Enter your username or recovery email</p></div>
+  {error_html}{success_html}
+  {'<form method="POST" action="/forgot-password"><div class="fg"><label for="identifier">Username or Recovery Email</label><input type="text" id="identifier" name="identifier" required autofocus></div><button type="submit" class="btn"><i class="fas fa-paper-plane"></i> Send Reset Link</button></form>' if not success else ''}
+  <a href="/login" class="back"><i class="fas fa-arrow-left"></i> Back to Login</a>
+</div></body></html>"""
+
+
+def page_reset_password(token, error=""):
+    error_html = f'<div class="alert" style="background:rgba(239,68,68,0.1);border:1px solid #ef4444;color:#ef4444;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(error)}</div>' if error else ""
+    return f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Reset Password – Fingerprint Release Manager</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<style>
+:root{{--primary:#2563eb;--gray-50:#f9fafb;--gray-200:#e5e7eb;--gray-400:#9ca3af;--gray-700:#374151;--gray-900:#111827;}}
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,var(--primary) 0%,#1e40af 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
+.card{{background:white;border-radius:.5rem;box-shadow:0 10px 25px rgba(0,0,0,.2);padding:3rem;width:100%;max-width:400px;}}
+.brand{{text-align:center;margin-bottom:2rem;}}
+.brand i{{font-size:3rem;color:var(--primary);margin-bottom:.5rem;}}
+.brand h1{{font-size:1.5rem;color:var(--gray-900);margin:0;}}
+.fg{{margin-bottom:1.5rem;}}
+label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--gray-700);}}
+input{{width:100%;padding:.75rem;border:1px solid var(--gray-200);border-radius:.375rem;font-size:.875rem;font-family:inherit;}}
+input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1);}}
+.btn{{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.375rem;font-size:.875rem;font-weight:500;cursor:pointer;}}
+.btn:hover{{background:#1e40af;}}
+.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;}}
+.hint{{color:#6b7280;font-size:.8rem;margin-top:.25rem;}}
+</style></head><body>
+<div class="card">
+  <div class="brand"><i class="fas fa-key"></i><h1>Set New Password</h1></div>
+  {error_html}
+  <form method="POST" action="/reset-password">
+    <input type="hidden" name="token" value="{h(token)}">
+    <div class="fg">
+      <label for="password">New Password</label>
+      <input type="password" id="password" name="password" required minlength="8" autofocus>
+      <p class="hint">Minimum 8 characters</p>
+    </div>
+    <div class="fg">
+      <label for="confirm">Confirm Password</label>
+      <input type="password" id="confirm" name="confirm" required minlength="8">
+    </div>
+    <button type="submit" class="btn"><i class="fas fa-lock"></i> Reset Password</button>
+  </form>
+  <a href="/login" class="back"><i class="fas fa-arrow-left"></i> Back to Login</a>
+</div></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# User Management Pages (admin only)
+# ---------------------------------------------------------------------------
+def page_users(db, user):
+    rows = db.execute(
+        "SELECT id, username, display_name, role, is_active, recovery_email, created_at, last_login FROM users ORDER BY id"
+    ).fetchall()
+    content = """
+    <div style="margin-bottom:1rem;display:flex;gap:.5rem;">
+      <a href="/users/add" class="btn btn-primary"><i class="fas fa-user-plus"></i> Create User</a>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Username</th><th>Display Name</th><th>Role</th><th>Recovery Email</th><th>Status</th><th>Last Login</th><th>Actions</th></tr></thead>
+        <tbody>
+    """
+    for r in rows:
+        active_badge = ('<span class="status-badge status-emailed">Active</span>' if r["is_active"]
+                        else '<span class="status-badge status-pending">Disabled</span>')
+        toggle_label = "Disable" if r["is_active"] else "Enable"
+        toggle_class = "btn-danger" if r["is_active"] else "btn-success"
+        can_delete = r["id"] != user["id"] and r["role"] != "admin"
+        _uname_escaped = h(r["username"])
+        delete_btn = (
+            f'<form method="POST" action="/users/{r["id"]}/delete" style="display:inline;" '
+            f'onsubmit="return confirm(\'Delete user {_uname_escaped}? This cannot be undone.\');">'
+            f'<button type="submit" class="btn btn-danger btn-small"><i class="fas fa-trash"></i></button></form>'
+            if can_delete else ''
+        )
+        self_tag = ' <em style="color:#9ca3af;font-size:.75rem;">(you)</em>' if r["id"] == user["id"] else ""
+        content += f"""
+        <tr>
+          <td><strong>{h(r["username"])}</strong>{self_tag}</td>
+          <td>{h(r["display_name"] or "-")}</td>
+          <td><span class="status-badge {'status-emailed' if r['role']=='admin' else 'status-code_assigned'}">{h(r["role"])}</span></td>
+          <td>{h(r["recovery_email"] or "-")}</td>
+          <td>{active_badge}</td>
+          <td>{fmt_dt(r["last_login"])}</td>
+          <td style="white-space:nowrap;">
+            <form method="POST" action="/users/{r['id']}/toggle" style="display:inline;">
+              <button type="submit" class="btn btn-small {toggle_class}">{toggle_label}</button>
+            </form>
+            <a href="/users/{r['id']}/reset" class="btn btn-small" style="background:#6c757d;color:white;">Reset PW</a>
+            {delete_btn}
+          </td>
+        </tr>"""
+    content += "</tbody></table></div>"
+    return render_page("User Management", content, active="users", user=user)
+
+
+def page_add_user(nav_user=None, error=""):
+    error_html = f'<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> {h(error)}</div>' if error else ""
+    content = f"""{error_html}
+    <div class="card">
+      <form method="POST" action="/users/add">
+        <div class="grid-2">
+          <div class="form-group"><label for="username">Username *</label><input type="text" id="username" name="username" required autocomplete="off"></div>
+          <div class="form-group"><label for="display_name">Display Name</label><input type="text" id="display_name" name="display_name" autocomplete="off"></div>
+        </div>
+        <div class="grid-2">
+          <div class="form-group"><label for="password">Password *</label><input type="password" id="password" name="password" required minlength="8" autocomplete="new-password"></div>
+          <div class="form-group"><label for="role">Role</label>
+            <select id="role" name="role">
+              <option value="user">User</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group"><label for="recovery_email">Recovery Email</label><input type="email" id="recovery_email" name="recovery_email" placeholder="user@example.com" autocomplete="off"></div>
+        <button type="submit" class="btn btn-primary"><i class="fas fa-user-plus"></i> Create User</button>
+        <a href="/users" class="btn" style="background:var(--gray-300);color:var(--gray-900);">Cancel</a>
+      </form>
+    </div>"""
+    return render_page("Create User", content, active="users", user=nav_user)
+
+
+def page_reset_user_password(user_id, username, nav_user=None, error=""):
+    error_html = f'<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> {h(error)}</div>' if error else ""
+    content = f"""{error_html}
+    <div class="card">
+      <p style="margin-bottom:1rem;">Set a new password for <strong>{h(username)}</strong>.</p>
+      <form method="POST" action="/users/{user_id}/reset">
+        <div class="form-group"><label for="new_password">New Password</label><input type="password" id="new_password" name="new_password" required minlength="8" autocomplete="new-password"></div>
+        <div class="form-group"><label for="confirm_password">Confirm Password</label><input type="password" id="confirm_password" name="confirm_password" required minlength="8" autocomplete="new-password"></div>
+        <button type="submit" class="btn btn-primary"><i class="fas fa-key"></i> Set Password</button>
+        <a href="/users" class="btn" style="background:var(--gray-300);color:var(--gray-900);">Cancel</a>
+      </form>
+    </div>"""
+    return render_page(f"Reset Password: {username}", content, active="users", user=nav_user)
+
+
+# ---------------------------------------------------------------------------
+# Profile / My Account Page (per-user recovery email)
+# ---------------------------------------------------------------------------
+def page_profile(db, user, error="", success=""):
+    u = db.execute("SELECT * FROM users WHERE id=%s", (user["id"],)).fetchone()
+    recovery_val = h(u.get("recovery_email") or "")
+    display_val = h(u.get("display_name") or "")
+    error_html = f'<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> {h(error)}</div>' if error else ""
+    success_html = f'<div class="alert alert-success"><i class="fas fa-check-circle"></i> {h(success)}</div>' if success else ""
+    content = f"""{error_html}{success_html}
+    <div class="card">
+      <div class="card-title"><i class="fas fa-user-cog"></i> My Account</div>
+      <form method="POST" action="/profile">
+        <div class="grid-2">
+          <div class="form-group"><label>Username</label><input type="text" value="{h(u['username'])}" disabled style="background:#f3f4f6;"></div>
+          <div class="form-group"><label for="display_name">Display Name</label><input type="text" id="display_name" name="display_name" value="{display_val}"></div>
+        </div>
+        <div class="form-group">
+          <label for="recovery_email">Recovery Email</label>
+          <input type="email" id="recovery_email" name="recovery_email" value="{recovery_val}" placeholder="your@email.com">
+          <p style="margin-top:.5rem;color:var(--gray-500);font-size:.875rem;">Used to receive password reset links. Keep this updated.</p>
+        </div>
+        <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Profile</button>
+      </form>
+    </div>
+    <div class="card" style="margin-top:1.5rem;">
+      <div class="card-title"><i class="fas fa-key"></i> Change Password</div>
+      <form method="POST" action="/profile/change-password">
+        <div class="form-group"><label for="current_password">Current Password</label><input type="password" id="current_password" name="current_password" required autocomplete="current-password"></div>
+        <div class="grid-2">
+          <div class="form-group"><label for="new_password">New Password</label><input type="password" id="new_password" name="new_password" required minlength="8" autocomplete="new-password"></div>
+          <div class="form-group"><label for="confirm_password">Confirm New Password</label><input type="password" id="confirm_password" name="confirm_password" required minlength="8" autocomplete="new-password"></div>
+        </div>
+        <button type="submit" class="btn btn-primary"><i class="fas fa-lock"></i> Change Password</button>
+      </form>
+    </div>"""
+    return render_page("My Account", content, active="profile", user=user)
 
 
 # ---------------------------------------------------------------------------
@@ -1705,6 +2005,24 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/login":
                 self._send(200, page_login())
 
+            elif path == "/forgot-password":
+                self._send(200, page_forgot_password())
+
+            elif path == "/reset-password":
+                token = params.get("token", [None])[0] or ""
+                if not token:
+                    self._redirect("/forgot-password")
+                    return
+                # Validate token exists and is not expired/used
+                row = db.execute(
+                    "SELECT * FROM password_reset_tokens WHERE token=%s AND used=FALSE AND expires_at > NOW()",
+                    (token,)
+                ).fetchone()
+                if not row:
+                    self._send(200, page_forgot_password(error="This reset link is invalid or has expired. Please request a new one."))
+                else:
+                    self._send(200, page_reset_password(token))
+
             elif path == "/logout":
                 # FIX: Logout now (1) deletes session from DB, (2) expires cookie,
                 # (3) only sends ONE response (redirect only, not body+redirect)
@@ -1715,22 +2033,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/login", clear_cookie=True)
 
             elif path == "/":
-                self._send(200, page_dashboard(db))
+                self._send(200, page_dashboard(db, nav_user=user))
 
             elif path == "/applicants":
-                self._send(200, page_applicants(db, params))
+                self._send(200, page_applicants(db, params, nav_user=user))
 
             elif path == "/applicants/add":
-                self._send(200, page_add_applicant())
+                self._send(200, page_add_applicant(nav_user=user))
 
             elif path == "/clients":
-                self._send(200, page_clients(db, params))
+                self._send(200, page_clients(db, params, nav_user=user))
 
             elif path == "/codes":
-                self._send(200, page_codes(db, params))
+                self._send(200, page_codes(db, params, nav_user=user))
 
             elif path == "/codes/import":
-                self._send(200, page_import_codes())
+                self._send(200, page_import_codes(nav_user=user))
 
             elif path == "/codes/manual":
                 content = """
@@ -1750,13 +2068,44 @@ class Handler(BaseHTTPRequestHandler):
                     </form>
                 </div>
                 """
-                self._send(200, render_page("Add Codes Manually", content, active="codes"))
+                self._send(200, render_page("Add Codes Manually", content, active="codes", user=user))
 
             elif path == "/settings":
-                self._send(200, page_settings(db))
+                self._send(200, page_settings(db, nav_user=user))
+
+            elif path == "/profile":
+                self._send(200, page_profile(db, user))
+
+            elif path == "/users":
+                if user.get("role") != "admin":
+                    self._send(403, render_page("Forbidden", '<div class="es"><i class="fas fa-lock"></i><h3>Admin access required</h3></div>', user=user))
+                else:
+                    self._send(200, page_users(db, user))
+
+            elif path == "/users/add":
+                if user.get("role") != "admin":
+                    self._send(403, render_page("Forbidden", '<div class="es"><i class="fas fa-lock"></i><h3>Admin access required</h3></div>', user=user))
+                else:
+                    self._send(200, page_add_user(nav_user=user))
+
+            elif path.startswith("/users/") and path.endswith("/reset"):
+                if user.get("role") != "admin":
+                    self._send(403, render_page("Forbidden", '<div class="es"><i class="fas fa-lock"></i><h3>Admin access required</h3></div>', user=user))
+                else:
+                    try:
+                        uid = int(path.split("/")[2])
+                    except (ValueError, IndexError):
+                        self._redirect("/users")
+                        return
+                    target = db.execute("SELECT username FROM users WHERE id=%s", (uid,)).fetchone()
+                    if not target:
+                        flash("User not found.", "error")
+                        self._redirect("/users")
+                    else:
+                        self._send(200, page_reset_user_password(uid, target["username"], nav_user=user))
 
             elif path == "/logs":
-                self._send(200, page_logs(db))
+                self._send(200, page_logs(db, nav_user=user))
 
             elif path.startswith("/api/track/"):
                 # Email open tracking pixel — no auth required (called by email clients)
@@ -1833,6 +2182,62 @@ class Handler(BaseHTTPRequestHandler):
             # ---------------------------------------------------------------
             # Login (no session required)
             # ---------------------------------------------------------------
+            if path == "/forgot-password":
+                form_data = self._parse_form()
+                def _fv_simple(name, default=""):
+                    if isinstance(form_data, cgi.FieldStorage):
+                        v = form_data.getfirst(name, default)
+                        return v if isinstance(v, str) else (v.decode() if v else default)
+                    vals = form_data.get(name, [default])
+                    return vals[0] if vals else default
+                identifier = _fv_simple("identifier").strip()
+                if not identifier:
+                    self._send(200, page_forgot_password(error="Please enter your username or recovery email."))
+                else:
+                    ok, msg = send_password_reset_email(db, identifier)
+                    if ok:
+                        self._send(200, page_forgot_password(success=msg))
+                    else:
+                        self._send(200, page_forgot_password(error=msg))
+                return
+
+            if path == "/reset-password":
+                form_data = self._parse_form()
+                def _fv_rp(name, default=""):
+                    if isinstance(form_data, cgi.FieldStorage):
+                        v = form_data.getfirst(name, default)
+                        return v if isinstance(v, str) else (v.decode() if v else default)
+                    vals = form_data.get(name, [default])
+                    return vals[0] if vals else default
+                token = _fv_rp("token").strip()
+                new_pass = _fv_rp("password")
+                confirm = _fv_rp("confirm")
+                if not token:
+                    self._redirect("/forgot-password")
+                    return
+                row = db.execute(
+                    "SELECT * FROM password_reset_tokens WHERE token=%s AND used=FALSE AND expires_at > NOW()",
+                    (token,)
+                ).fetchone()
+                if not row:
+                    self._send(200, page_forgot_password(error="This reset link is invalid or has expired. Please request a new one."))
+                    return
+                if len(new_pass) < 8:
+                    self._send(200, page_reset_password(token, error="Password must be at least 8 characters."))
+                    return
+                if new_pass != confirm:
+                    self._send(200, page_reset_password(token, error="Passwords do not match."))
+                    return
+                pw_hash = hash_password(new_pass)
+                db.execute("UPDATE users SET password_hash=%s WHERE id=%s", (pw_hash, row["user_id"]))
+                db.execute("UPDATE password_reset_tokens SET used=TRUE WHERE token=%s", (token,))
+                # Invalidate all active sessions for this user for security
+                db.execute("DELETE FROM sessions WHERE user_id=%s", (row["user_id"],))
+                logger.info(f"Password reset completed for user_id={row['user_id']}")
+                flash("Password reset successfully. Please log in with your new password.", "success")
+                self._redirect("/login")
+                return
+
             if path == "/login":
                 form_data = self._parse_form()
 
@@ -2332,6 +2737,142 @@ class Handler(BaseHTTPRequestHandler):
                         flash(f"Test failed: {type(e).__name__}: {e}", "error")
                 self._redirect("/settings")
 
+            # ------------------------------------------------------------------
+            # Profile / My Account
+            # ------------------------------------------------------------------
+            elif path == "/profile":
+                new_display = fv("display_name").strip()
+                new_recovery = fv("recovery_email").strip()
+                if new_recovery and ("@" not in new_recovery or "." not in new_recovery.split("@")[-1]):
+                    flash("Invalid recovery email format.", "error")
+                else:
+                    db.execute(
+                        "UPDATE users SET display_name=%s, recovery_email=%s WHERE id=%s",
+                        (new_display or None, new_recovery or None, user["id"])
+                    )
+                    flash("Profile updated.", "success")
+                self._redirect("/profile")
+
+            elif path == "/profile/change-password":
+                current = fv("current_password")
+                new_pw = fv("new_password")
+                confirm = fv("confirm_password")
+                u_row = db.execute("SELECT * FROM users WHERE id=%s", (user["id"],)).fetchone()
+                if not verify_password(current, u_row["password_hash"]):
+                    flash("Current password is incorrect.", "error")
+                elif len(new_pw) < 8:
+                    flash("New password must be at least 8 characters.", "error")
+                elif new_pw != confirm:
+                    flash("New passwords do not match.", "error")
+                else:
+                    db.execute("UPDATE users SET password_hash=%s WHERE id=%s",
+                               (hash_password(new_pw), user["id"]))
+                    flash("Password changed successfully.", "success")
+                self._redirect("/profile")
+
+            # ------------------------------------------------------------------
+            # User Management (admin only)
+            # ------------------------------------------------------------------
+            elif path == "/users/add":
+                if user.get("role") != "admin":
+                    self._send(403, render_page("Forbidden", '<div class="es"><i class="fas fa-lock"></i><h3>Admin access required</h3></div>', user=user))
+                else:
+                    new_username = fv("username").strip()
+                    new_display = fv("display_name").strip()
+                    new_password = fv("password")
+                    new_role = fv("role", "user")
+                    new_recovery = fv("recovery_email").strip()
+                    if not new_username or not new_password:
+                        flash("Username and password are required.", "error")
+                        self._redirect("/users/add")
+                    elif len(new_password) < 8:
+                        flash("Password must be at least 8 characters.", "error")
+                        self._redirect("/users/add")
+                    elif new_role not in ("user", "admin"):
+                        flash("Invalid role.", "error")
+                        self._redirect("/users/add")
+                    else:
+                        try:
+                            db.execute(
+                                "INSERT INTO users (username, password_hash, display_name, role, recovery_email, is_active) VALUES (%s,%s,%s,%s,%s,TRUE)",
+                                (new_username, hash_password(new_password), new_display or None, new_role, new_recovery or None)
+                            )
+                            flash(f"User '{new_username}' created.", "success")
+                            self._redirect("/users")
+                        except psycopg2.IntegrityError:
+                            db.rollback()
+                            flash(f"Username '{new_username}' already exists.", "error")
+                            self._redirect("/users/add")
+
+            elif path.startswith("/users/") and path.endswith("/toggle"):
+                if user.get("role") != "admin":
+                    self._send(403, render_page("Forbidden", '<div class="es"><i class="fas fa-lock"></i><h3>Admin access required</h3></div>', user=user))
+                else:
+                    try:
+                        uid = int(path.split("/")[2])
+                    except (ValueError, IndexError):
+                        self._redirect("/users")
+                        return
+                    if uid == user["id"]:
+                        flash("You cannot disable your own account.", "error")
+                    else:
+                        target = db.execute("SELECT is_active, username FROM users WHERE id=%s", (uid,)).fetchone()
+                        if target:
+                            new_state = not target["is_active"]
+                            db.execute("UPDATE users SET is_active=%s WHERE id=%s", (new_state, uid))
+                            action = "enabled" if new_state else "disabled"
+                            flash(f"User '{target['username']}' {action}.", "success")
+                    self._redirect("/users")
+
+            elif path.startswith("/users/") and path.endswith("/reset"):
+                if user.get("role") != "admin":
+                    self._send(403, render_page("Forbidden", '<div class="es"><i class="fas fa-lock"></i><h3>Admin access required</h3></div>', user=user))
+                else:
+                    try:
+                        uid = int(path.split("/")[2])
+                    except (ValueError, IndexError):
+                        self._redirect("/users")
+                        return
+                    new_pw = fv("new_password")
+                    confirm = fv("confirm_password")
+                    target = db.execute("SELECT username FROM users WHERE id=%s", (uid,)).fetchone()
+                    if not target:
+                        flash("User not found.", "error")
+                        self._redirect("/users")
+                    elif len(new_pw) < 8:
+                        self._send(200, page_reset_user_password(uid, target["username"], nav_user=user, error="Password must be at least 8 characters."))
+                    elif new_pw != confirm:
+                        self._send(200, page_reset_user_password(uid, target["username"], nav_user=user, error="Passwords do not match."))
+                    else:
+                        db.execute("UPDATE users SET password_hash=%s WHERE id=%s", (hash_password(new_pw), uid))
+                        # Invalidate existing sessions for that user
+                        db.execute("DELETE FROM sessions WHERE user_id=%s", (uid,))
+                        flash(f"Password reset for '{target['username']}'.", "success")
+                        self._redirect("/users")
+
+            elif path.startswith("/users/") and path.endswith("/delete"):
+                if user.get("role") != "admin":
+                    self._send(403, render_page("Forbidden", '<div class="es"><i class="fas fa-lock"></i><h3>Admin access required</h3></div>', user=user))
+                else:
+                    try:
+                        uid = int(path.split("/")[2])
+                    except (ValueError, IndexError):
+                        self._redirect("/users")
+                        return
+                    target = db.execute("SELECT username, role FROM users WHERE id=%s", (uid,)).fetchone()
+                    if not target:
+                        flash("User not found.", "error")
+                    elif target["role"] == "admin":
+                        flash("Admin accounts cannot be deleted.", "error")
+                    elif uid == user["id"]:
+                        flash("You cannot delete your own account.", "error")
+                    else:
+                        db.execute("DELETE FROM sessions WHERE user_id=%s", (uid,))
+                        db.execute("DELETE FROM password_reset_tokens WHERE user_id=%s", (uid,))
+                        db.execute("DELETE FROM users WHERE id=%s", (uid,))
+                        flash(f"User '{target['username']}' deleted.", "success")
+                    self._redirect("/users")
+
             else:
                 self._send(404, render_page("Not Found",
                     '<div class="es"><i class="fas fa-exclamation-triangle"></i><h3>Page not found</h3></div>'))
@@ -2352,8 +2893,8 @@ if __name__ == "__main__":
     ║   Web UI:      http://localhost:{PORT}                     ║
     ║                                                          ║
     ║   DEFAULT LOGIN:                                         ║
-    ║   Username: admin                                        ║
-    ║   Password: admin123  (change immediately!)              ║
+    ║   Username: Brsolutions                                  ║
+    ║   Password: BRS#985!                                     ║
     ║                                                          ║
     ║   AUTO-IMPORT:                                           ║
     ║   Drop .xlsx/.csv files into the 'watch/' folder         ║
