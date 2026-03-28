@@ -825,6 +825,13 @@ def send_release_email(db, applicant_id):
             "INSERT INTO email_log (applicant_id,recipient_email,subject,status,error_message) VALUES (%s,%s,%s,'failed',%s)",
             (applicant_id, a["email"], subj, str(e))
         )
+        # Update applicant status to 'email_failed' so the failure is visible
+        # in the applicants list.  Preserve any previously-assigned code.
+        now_fail = datetime.now().isoformat()
+        db.execute(
+            "UPDATE applicants SET status='email_failed', updated_at=%s WHERE id = %s",
+            (now_fail, applicant_id)
+        )
         db.commit()
         return False, str(e)
 
@@ -1179,6 +1186,8 @@ def render_page(title, content, active="", user=None):
             .status-emailed {{ background: rgba(59, 130, 246, 0.1); color: var(--primary); }}
             .status-opened {{ background: rgba(16, 185, 129, 0.1); color: var(--success); }}
             .status-completed {{ background: rgba(16, 185, 129, 0.1); color: var(--success); }}
+            .status-email_failed {{ background: rgba(220, 38, 38, 0.15); color: #dc2626; border: 1px solid rgba(220, 38, 38, 0.3); animation: pulse-fail 2s ease-in-out infinite; }}
+            @keyframes pulse-fail {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} }}
             .email-status {{ display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 0.25rem; }}
             .email-status-opened {{ background: var(--success); }}
             .email-status-not-opened {{ background: var(--danger); }}
@@ -1297,6 +1306,7 @@ def page_dashboard(db, nav_user=None):
     total_app = db.execute("SELECT COUNT(*) as cnt FROM applicants").fetchone()["cnt"]
     pending = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='pending'").fetchone()["cnt"]
     emailed = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='emailed'").fetchone()["cnt"]
+    email_failed = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE status='email_failed'").fetchone()["cnt"]
     codes_avail = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NULL").fetchone()["cnt"]
     codes_used = db.execute("SELECT COUNT(*) as cnt FROM codes WHERE assigned_to IS NOT NULL").fetchone()["cnt"]
 
@@ -1304,7 +1314,10 @@ def page_dashboard(db, nav_user=None):
         SELECT type, id, col1, col2, ts FROM (
             SELECT 'new_applicant' as type, id, first_name as col1, last_name as col2, created_at as ts FROM applicants
             UNION ALL
-            SELECT 'email_sent' as type, id, recipient_email as col1, subject as col2, sent_at as ts FROM email_log
+            SELECT CASE WHEN status = 'failed' THEN 'email_failed' ELSE 'email_sent' END as type,
+                   id, recipient_email as col1,
+                   CASE WHEN status = 'failed' THEN COALESCE(error_message, 'Unknown error') ELSE subject END as col2,
+                   sent_at as ts FROM email_log
         ) combined
         ORDER BY ts DESC NULLS LAST
         LIMIT 10
@@ -1319,11 +1332,51 @@ def page_dashboard(db, nav_user=None):
         LIMIT 5
     """).fetchall()
 
+    # Alert banner shown when there are applicants whose emails failed or were blocked
+    fail_alert_html = ""
+    if email_failed > 0:
+        # Fetch the most recent failures for the alert details
+        recent_fails = db.execute(
+            "SELECT a.first_name, a.last_name, a.email, el.error_message, el.sent_at "
+            "FROM applicants a "
+            "JOIN email_log el ON el.applicant_id = a.id AND el.status = 'failed' "
+            "WHERE a.status = 'email_failed' "
+            "ORDER BY el.sent_at DESC LIMIT 5"
+        ).fetchall()
+        fail_details = ""
+        for rf in recent_fails:
+            err_short = h((rf["error_message"] or "Unknown error")[:120])
+            fail_details += (
+                f'<div style="padding:0.4rem 0; border-bottom:1px solid rgba(220,38,38,0.15);">'
+                f'<strong>{h(rf["first_name"])} {h(rf["last_name"])}</strong> '
+                f'&lt;{h(rf["email"] or "no email")}&gt; &mdash; '
+                f'<span style="color:#991b1b;">{err_short}</span> '
+                f'<span style="color:#6b7280; font-size:0.75rem;">({fmt_dt(rf["sent_at"])})</span>'
+                f'</div>'
+            )
+        fail_alert_html = f"""
+        <div style="background: rgba(220,38,38,0.08); border: 1px solid rgba(220,38,38,0.3); border-radius: 0.5rem; padding: 1rem 1.25rem; margin-bottom: 1.25rem; display: flex; align-items: flex-start; gap: 0.75rem;">
+            <i class="fas fa-exclamation-triangle" style="color: #dc2626; font-size: 1.25rem; margin-top: 0.15rem;"></i>
+            <div style="flex: 1;">
+                <div style="font-weight: 600; color: #dc2626; margin-bottom: 0.25rem;">
+                    {email_failed} applicant{'s' if email_failed != 1 else ''} with failed/blocked email{'s' if email_failed != 1 else ''}
+                </div>
+                <div style="font-size: 0.85rem; color: #374151; margin-bottom: 0.5rem;">
+                    The following emails could not be delivered. Review and retry from the
+                    <a href="/applicants" style="color: #dc2626; font-weight: 600;">Applicants</a> page.
+                </div>
+                {fail_details}
+            </div>
+        </div>
+        """
+
     stats_html = f"""
+    {fail_alert_html}
     <div class="stats">
         <div class="stat-card"><div class="stat-icon"><i class="fas fa-users"></i></div><div class="stat-label">Total Applicants</div><div class="stat-value">{total_app}</div></div>
         <div class="stat-card"><div class="stat-icon"><i class="fas fa-clock"></i></div><div class="stat-label">Pending</div><div class="stat-value">{pending}</div></div>
         <div class="stat-card"><div class="stat-icon"><i class="fas fa-envelope"></i></div><div class="stat-label">Emailed</div><div class="stat-value">{emailed}</div></div>
+        <div class="stat-card" {'style="border-color: rgba(220,38,38,0.4); background: rgba(220,38,38,0.04);"' if email_failed > 0 else ''}><div class="stat-icon"><i class="fas fa-envelope-open" style="{'color:#dc2626;' if email_failed > 0 else ''}"></i></div><div class="stat-label" style="{'color:#dc2626;' if email_failed > 0 else ''}">Email Failed</div><div class="stat-value" style="{'color:#dc2626;' if email_failed > 0 else ''}">{email_failed}</div></div>
         <div class="stat-card"><div class="stat-icon"><i class="fas fa-check"></i></div><div class="stat-label">Codes Available</div><div class="stat-value">{codes_avail}</div></div>
         <div class="stat-card"><div class="stat-icon"><i class="fas fa-lock"></i></div><div class="stat-label">Codes Used</div><div class="stat-value">{codes_used}</div></div>
     </div>
@@ -1341,6 +1394,8 @@ def page_dashboard(db, nav_user=None):
             activity_html += f'<tr><td><span class="status-badge status-pending">New</span></td><td>{h(a["col1"])} {h(a["col2"])}</td><td>{fmt_dt(a["ts"])}</td></tr>'
         elif a["type"] == "email_sent":
             activity_html += f'<tr><td><span class="status-badge status-emailed">Email</span></td><td>{h(a["col1"] or "-")} - {h(a["col2"] or "-")}</td><td>{fmt_dt(a["ts"])}</td></tr>'
+        elif a["type"] == "email_failed":
+            activity_html += f'<tr><td><span class="status-badge status-email_failed">Failed</span></td><td>{h(a["col1"] or "-")} &mdash; {h((a["col2"] or "Unknown error")[:80])}</td><td>{fmt_dt(a["ts"])}</td></tr>'
     activity_html += "</tbody></table></div>"
 
     return render_page("Dashboard", stats_html + clients_html + activity_html, active="dashboard", user=nav_user)
