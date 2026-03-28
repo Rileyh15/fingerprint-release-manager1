@@ -35,6 +35,7 @@ import base64
 import uuid
 import hashlib
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -789,7 +790,7 @@ def post_accio_result(db, applicant_id):
     order_type     = (a.get("accio_order_type") or "Fingerprint").strip() or "Fingerprint"
     assigned_code  = (a.get("assigned_code") or "").strip()
 
-    sent_at = datetime.now().strftime("%m/%d/%Y %I:%M %p")
+    sent_at = datetime.now(tz=ZoneInfo("America/Chicago")).strftime("%m/%d/%Y %I:%M %p CST")
     note_text = (
         f"FP Release email sent on {sent_at}. "
         f"Assigned fingerprint code: {assigned_code}"
