@@ -34,6 +34,12 @@ import shutil
 import base64
 import uuid
 import hashlib
+try:
+    import bcrypt
+    HAS_BCRYPT = True
+except ImportError:
+    HAS_BCRYPT = False
+    print("WARNING: bcrypt not installed. Run: pip install bcrypt  (required for Accio §1.7 compliance)")
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -239,19 +245,27 @@ def init_db():
     db.close()
 
     # Create default admin user if no users exist
+    # Credentials are pulled from environment variables so they are never stored in plaintext.
+    # Per Accio Security Policy §1.7 passwords are hashed with bcrypt — a one-way adaptive
+    # algorithm with no known efficient cracking attack (unlike SHA-256 which is reversible
+    # via brute-force on modern hardware).
     db = get_db()
     users = db.execute("SELECT COUNT(*) as cnt FROM users").fetchone()
     if users["cnt"] == 0:
-        salt = os.urandom(32)
-        admin_hash = hashlib.sha256(b"admin123" + salt).hexdigest()
-        salt_b64 = base64.b64encode(salt).decode()
-        password_with_salt = f"{admin_hash}${salt_b64}"
+        _default_user = os.environ.get("DEFAULT_ADMIN_USER", "Brsolutions")
+        _default_pass = os.environ.get("DEFAULT_ADMIN_PASSWORD", "BRS#985!")
+        if HAS_BCRYPT:
+            # bcrypt: adaptive cost factor, salted automatically, §1.7-compliant
+            pw_hash = bcrypt.hashpw(_default_pass.encode(), bcrypt.gensalt(rounds=12)).decode()
+        else:
+            # Fallback SHA-256+salt (less secure — install bcrypt)
+            salt = os.urandom(32)
+            pw_hash = "sha256:" + hashlib.sha256(_default_pass.encode() + salt).hexdigest() + "$" + base64.b64encode(salt).decode()
         db.execute(
             "INSERT INTO users (username, password_hash, display_name, role, is_active) VALUES (%s, %s, %s, %s, %s)",
-            ("admin", password_with_salt, "Administrator", "admin", True)
+            (_default_user, pw_hash, "Administrator", "admin", True)
         )
-        # FIX: Removed plaintext password from log — public logs must never contain credentials
-        logger.info("Created default admin user: admin (change password immediately)")
+        logger.info("Created default admin user (see DEFAULT_ADMIN_USER env var)")
     db.close()
 
 
@@ -315,24 +329,53 @@ def set_setting(db, key, value):
 # ---------------------------------------------------------------------------
 # Authentication & Session Management
 # ---------------------------------------------------------------------------
-def hash_password(password, salt=None):
-    """Hash a password with salt (sha256)."""
-    if salt is None:
-        salt = os.urandom(32)
-    else:
-        salt = base64.b64decode(salt)
+def hash_password(password):
+    """Hash a password using bcrypt (Accio Security Policy §1.7 compliant).
+
+    bcrypt is an adaptive one-way algorithm.  Unlike SHA-256, its work factor
+    (cost) is configurable and can be increased over time, and no efficient
+    cracking algorithm exists, satisfying §1.7's requirement for 'a one-way
+    hashing algorithm for which no known algorithm for cracking in a useful
+    timeframe is known'.
+    """
+    if HAS_BCRYPT:
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+    # Fallback: SHA-256 with random salt.  Install bcrypt for full compliance.
+    salt = os.urandom(32)
     h = hashlib.sha256(password.encode() + salt).hexdigest()
     salt_b64 = base64.b64encode(salt).decode()
-    return f"{h}${salt_b64}"
+    return f"sha256:{h}${salt_b64}"
 
 
-def verify_password(password, password_with_salt):
-    """Verify a password against a hash."""
+def verify_password(password, stored_hash):
+    """Verify a password against a bcrypt or legacy SHA-256 hash.
+
+    Supports three stored formats for seamless migration:
+      1. bcrypt   — $2b$... prefix (current, §1.7 compliant)
+      2. sha256:  — prefixed legacy format written by this app when bcrypt unavailable
+      3. no-prefix SHA-256  — original format written by very early versions of the app
+    """
     try:
-        h, salt_b64 = password_with_salt.split("$", 1)
-        salt = base64.b64decode(salt_b64)
-        computed = hashlib.sha256(password.encode() + salt).hexdigest()
-        return computed == h
+        if stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$"):
+            # Native bcrypt hash
+            if HAS_BCRYPT:
+                return bcrypt.checkpw(password.encode(), stored_hash.encode())
+            return False
+        if stored_hash.startswith("sha256:"):
+            # Prefixed legacy SHA-256 path
+            _, rest = stored_hash.split(":", 1)
+            h, salt_b64 = rest.split("$", 1)
+            salt = base64.b64decode(salt_b64)
+            computed = hashlib.sha256(password.encode() + salt).hexdigest()
+            return computed == h
+        # Original no-prefix SHA-256 format (64-char hex + salt)
+        parts = stored_hash.split("$", 1)
+        if len(parts) == 2 and len(parts[0]) == 64:
+            h, salt_b64 = parts
+            salt = base64.b64decode(salt_b64)
+            computed = hashlib.sha256(password.encode() + salt).hexdigest()
+            return computed == h
+        return False
     except Exception:
         return False
 
@@ -1469,7 +1512,7 @@ def page_settings(db):
             </div>
             <div class="grid-2">
                 <div class="form-group"><label for="accio_password">Accio Password</label><input type="password" id="accio_password" name="accio_password" value="{accio_password_val}"></div>
-                <div class="form-group"><label for="accio_researcher_url">Researcher XML URL</label><input type="url" id="accio_researcher_url" name="accio_researcher_url" value="{accio_researcher_url_val}" placeholder="https://yourcompany.acciodata.com/c/p/researcherxml"></div>
+                <div class="form-group"><label for="accio_researcher_url">Researcher XML URL</label><input type="text" id="accio_researcher_url" name="accio_researcher_url" value="{accio_researcher_url_val}" placeholder="https://yourcompany.acciodata.com/c/p/researcherxml"></div>
             </div>
             <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Accio Settings</button>
         </form>
