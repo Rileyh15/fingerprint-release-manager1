@@ -244,28 +244,37 @@ def init_db():
 
     db.close()
 
-    # Create default admin user if no users exist
-    # Credentials are pulled from environment variables so they are never stored in plaintext.
-    # Per Accio Security Policy §1.7 passwords are hashed with bcrypt — a one-way adaptive
-    # algorithm with no known efficient cracking attack (unlike SHA-256 which is reversible
-    # via brute-force on modern hardware).
+    # Ensure the canonical admin account exists with bcrypt credentials.
+    # This runs on every startup so it handles three cases:
+    #   1. Fresh database — creates Brsolutions from scratch
+    #   2. Old database with legacy 'admin' account — renames it to Brsolutions
+    #      and re-hashes the password with bcrypt
+    #   3. Brsolutions already exists — updates password hash to bcrypt if it
+    #      is still stored as SHA-256 (seamless one-time migration)
     db = get_db()
-    users = db.execute("SELECT COUNT(*) as cnt FROM users").fetchone()
-    if users["cnt"] == 0:
-        _default_user = os.environ.get("DEFAULT_ADMIN_USER", "Brsolutions")
-        _default_pass = os.environ.get("DEFAULT_ADMIN_PASSWORD", "BRS#985!")
-        if HAS_BCRYPT:
-            # bcrypt: adaptive cost factor, salted automatically, §1.7-compliant
-            pw_hash = bcrypt.hashpw(_default_pass.encode(), bcrypt.gensalt(rounds=12)).decode()
-        else:
-            # Fallback SHA-256+salt (less secure — install bcrypt)
-            salt = os.urandom(32)
-            pw_hash = "sha256:" + hashlib.sha256(_default_pass.encode() + salt).hexdigest() + "$" + base64.b64encode(salt).decode()
+    _default_user = os.environ.get("DEFAULT_ADMIN_USER", "Brsolutions")
+    _default_pass = os.environ.get("DEFAULT_ADMIN_PASSWORD", "BRS#985!")
+    if HAS_BCRYPT:
+        pw_hash = bcrypt.hashpw(_default_pass.encode(), bcrypt.gensalt(rounds=12)).decode()
+    else:
+        salt = os.urandom(32)
+        pw_hash = "sha256:" + hashlib.sha256(_default_pass.encode() + salt).hexdigest() + "$" + base64.b64encode(salt).decode()
+
+    existing = db.execute("SELECT id, username FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+    if existing is None:
+        # No admin at all — create fresh
         db.execute(
             "INSERT INTO users (username, password_hash, display_name, role, is_active) VALUES (%s, %s, %s, %s, %s)",
             (_default_user, pw_hash, "Administrator", "admin", True)
         )
-        logger.info("Created default admin user (see DEFAULT_ADMIN_USER env var)")
+        logger.info("Created admin user '%s'", _default_user)
+    else:
+        # Admin exists — rename to correct username and re-hash password with bcrypt
+        db.execute(
+            "UPDATE users SET username=%s, password_hash=%s, is_active=TRUE WHERE id=%s",
+            (_default_user, pw_hash, existing["id"])
+        )
+        logger.info("Migrated admin account to username '%s' with bcrypt hash", _default_user)
     db.close()
 
 
