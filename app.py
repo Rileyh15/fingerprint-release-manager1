@@ -1979,6 +1979,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, page_codes(db, params))
             elif path == "/codes/import":
                 self._send(200, page_import_codes())
+            elif path == "/codes/manual":
+                content = """
+                <div class="card">
+                    <h2>Add Codes Manually</h2>
+                    <form method="POST" action="/codes/add-manual">
+                        <div style="margin-bottom: 1rem;">
+                            <label><strong>Batch Name</strong></label>
+                            <input type="text" name="batch_name" value="Manual" placeholder="Batch name" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px; margin-top:4px;">
+                        </div>
+                        <div style="margin-bottom: 1rem;">
+                            <label><strong>Codes</strong> (one per line)</label>
+                            <textarea name="codes" rows="10" placeholder="Enter one code per line" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px; margin-top:4px; font-family:monospace;"></textarea>
+                        </div>
+                        <button type="submit" class="btn btn-primary"><i class="fas fa-plus"></i> Add Codes</button>
+                        <a href="/codes" class="btn" style="background: var(--gray-300); color: var(--gray-900); margin-left:8px;">Cancel</a>
+                    </form>
+                </div>
+                """
+                self._send(200, render_page("Add Codes Manually", content, active="codes"))
             elif path == "/settings":
                 self._send(200, page_settings(db))
             elif path == "/logs":
@@ -2420,10 +2439,11 @@ class Handler(BaseHTTPRequestHandler):
                     if code_str:
                         try:
                             db.execute("INSERT INTO codes (code,batch_name) VALUES (%s,%s)", (code_str, batch))
+                            db.commit()
                             imp += 1
                         except psycopg2.IntegrityError:
+                            db.rollback()
                             dup += 1
-                db.commit()
                 flash(f"Added {imp} codes ({dup} duplicates skipped).", "success")
                 self._redirect("/codes")
 
