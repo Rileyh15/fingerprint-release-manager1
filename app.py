@@ -1131,12 +1131,12 @@ def page_applicants(db, params):
     search = (params.get("search", [None])[0] or "").lower()
     rows = db.execute("SELECT * FROM applicants ORDER BY created_at DESC").fetchall()
     if search:
-        rows = [r for r in rows if search in f"{r['first_name']} {r['last_name']}".lower()]
+        rows = [r for r in rows if search in f"{r['first_name']} {r['last_name']} {r['accio_order_number'] or ''}".lower()]
 
     content = f"""
     <div style="margin-bottom: 1rem; display: flex; gap: 0.5rem;">
         <form method="GET" style="flex: 1; display: flex; gap: 0.5rem;">
-            <input type="text" name="search" placeholder="Search by name..." style="flex: 1;" value="{h(search)}">
+            <input type="text" name="search" placeholder="Search by name or order #..." style="flex: 1;" value="{h(search)}">
             <button type="submit" class="btn btn-primary"><i class="fas fa-search"></i> Search</button>
         </form>
         <a href="/applicants/add" class="btn btn-primary"><i class="fas fa-plus"></i> Add Applicant</a>
@@ -1146,7 +1146,7 @@ def page_applicants(db, params):
     </div>
     <div class="card">
         <table>
-            <thead><tr><th>Status</th><th>Name</th><th>Email</th><th>Code</th><th>Email Opened</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Status</th><th>Order #</th><th>Name</th><th>Email</th><th>Code</th><th>Email Opened</th><th>Actions</th></tr></thead>
             <tbody>
     """
 
@@ -1163,11 +1163,13 @@ def page_applicants(db, params):
                             if opened else
                             '<span class="email-status email-status-not-opened"></span> No')
 
-        # FIX: Sanitize status value used in CSS class to prevent class injection
+        # Sanitize status value used in CSS class to prevent class injection
         safe_status = h(r['status']).replace(" ", "_")
+        order_num = h(r['accio_order_number'] or '-')
         content += f"""
                 <tr>
                     <td><span class="status-badge status-{safe_status}">{h(r['status'])}</span></td>
+                    <td><code style="font-size:0.8rem;">{order_num}</code></td>
                     <td>{h(r['first_name'])} {h(r['last_name'])}</td>
                     <td>
                         <form method="POST" action="/applicants/{r['id']}/update-email" style="display:flex; gap:4px; align-items:center;">
@@ -1390,11 +1392,11 @@ def page_clients(db, params):
             <p><strong>Total Applicants:</strong> {len(applicants)}</p>
         </div>
         <div class="card"><div class="card-title">Applicants</div>
-            <table><thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Code</th></tr></thead><tbody>
+            <table><thead><tr><th>Order #</th><th>Name</th><th>Email</th><th>Status</th><th>Code</th></tr></thead><tbody>
         """
         for a in applicants:
             safe_st = h(a['status']).replace(" ", "_")
-            content += f"<tr><td>{h(a['first_name'])} {h(a['last_name'])}</td><td>{h(a['email'] or '-')}</td><td><span class=\"status-badge status-{safe_st}\">{h(a['status'])}</span></td><td><code>{h(a['assigned_code'] or '-')}</code></td></tr>"
+            content += f"<tr><td><code style='font-size:0.8rem;'>{h(a['accio_order_number'] or '-')}</code></td><td>{h(a['first_name'])} {h(a['last_name'])}</td><td>{h(a['email'] or '-')}</td><td><span class=\"status-badge status-{safe_st}\">{h(a['status'])}</span></td><td><code>{h(a['assigned_code'] or '-')}</code></td></tr>"
         content += "</tbody></table></div>"
     else:
         clients = db.execute("""
