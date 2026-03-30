@@ -47,8 +47,11 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+from email.utils import formatdate, make_msgid
 from xml.etree import ElementTree as ET
 from string import Template
+import time
+import re
 
 try:
     import psycopg2
@@ -211,7 +214,10 @@ def init_db():
             email_log_id INTEGER REFERENCES email_log(id),
             tracking_token TEXT UNIQUE NOT NULL,
             opened_at TIMESTAMP,
+            first_human_open_at TIMESTAMP,
             open_count INTEGER DEFAULT 0,
+            bot_open_count INTEGER DEFAULT 0,
+            is_bot_open BOOLEAN DEFAULT FALSE,
             user_agent TEXT
         )
     """)
@@ -257,18 +263,45 @@ def init_db():
     except psycopg2.Error:
         pass  # Column already exists
 
+    # Migration: add bot-detection columns to email_tracking for existing databases
+    for col_sql in [
+        "ALTER TABLE email_tracking ADD COLUMN first_human_open_at TIMESTAMP",
+        "ALTER TABLE email_tracking ADD COLUMN bot_open_count INTEGER DEFAULT 0",
+        "ALTER TABLE email_tracking ADD COLUMN is_bot_open BOOLEAN DEFAULT FALSE",
+    ]:
+        try:
+            db.execute(col_sql)
+        except psycopg2.Error:
+            pass  # Column already exists
+
     db.close()
 
     # Ensure the canonical admin account exists with bcrypt credentials.
     # This runs on every startup so it handles three cases:
-    #   1. Fresh database — creates Brsolutions from scratch
-    #   2. Old database with legacy 'admin' account — renames it to Brsolutions
-    #      and re-hashes the password with bcrypt
-    #   3. Brsolutions already exists — updates password hash to bcrypt if it
-    #      is still stored as SHA-256 (seamless one-time migration)
+    #   1. Fresh database — creates admin from scratch (requires env vars)
+    #   2. Old database with legacy 'admin' account — renames and re-hashes
+    #   3. Admin already exists — updates password hash to bcrypt if needed
     db = get_db()
-    _default_user = os.environ.get("DEFAULT_ADMIN_USER", "Brsolutions")
-    _default_pass = os.environ.get("DEFAULT_ADMIN_PASSWORD", "BRS#985!")
+    _default_user = os.environ.get("DEFAULT_ADMIN_USER", "").strip()
+    _default_pass = os.environ.get("DEFAULT_ADMIN_PASSWORD", "").strip()
+    if not _default_user or not _default_pass:
+        # Only warn on first run when no admin exists yet; otherwise the
+        # admin account is already in the database and env vars aren't needed.
+        existing_check = db.execute("SELECT id FROM users WHERE role='admin' LIMIT 1").fetchone()
+        if existing_check is None:
+            logger.critical(
+                "DEFAULT_ADMIN_USER and DEFAULT_ADMIN_PASSWORD environment variables "
+                "are required for initial setup. Set them in your Render/hosting "
+                "environment variables, then restart."
+            )
+            print("\n*** FATAL: Set DEFAULT_ADMIN_USER and DEFAULT_ADMIN_PASSWORD "
+                  "environment variables before first run. ***\n")
+            db.close()
+            sys.exit(1)
+        else:
+            # Admin already exists in DB — no env vars needed for normal startup
+            db.close()
+            return
     if HAS_BCRYPT:
         pw_hash = bcrypt.hashpw(_default_pass.encode(), bcrypt.gensalt(rounds=12)).decode()
     else:
@@ -297,18 +330,18 @@ def init_db():
 # Settings
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS = {
-    "accio_account": os.environ.get("ACCIO_ACCOUNT", "brsolutions"),
-    "accio_username": os.environ.get("ACCIO_USERNAME", "admin"),
-    "accio_password": os.environ.get("ACCIO_PASSWORD", "Fingerprint"),
-    "accio_post_url": os.environ.get("ACCIO_POST_URL", "https://fingerprint-release-manager1.onrender.com/api/accio-push"),
+    "accio_account": os.environ.get("ACCIO_ACCOUNT", ""),
+    "accio_username": os.environ.get("ACCIO_USERNAME", ""),
+    "accio_password": os.environ.get("ACCIO_PASSWORD", ""),
+    "accio_post_url": os.environ.get("ACCIO_POST_URL", ""),
     "accio_researcher_url": os.environ.get("ACCIO_RESEARCHER_URL", ""),
     "smtp_server": os.environ.get("SMTP_HOST", "smtp.gmail.com"),
     "smtp_port": os.environ.get("SMTP_PORT", "587"),
     "smtp_username": os.environ.get("SMTP_USER", ""),
     "smtp_password": os.environ.get("SMTP_PASS", ""),
     "smtp_use_tls": os.environ.get("SMTP_USE_TLS", "1"),
-    "sender_email": os.environ.get("SENDER_EMAIL", "apply2check@br-solutions.net"),
-    "sender_name": "Fingerprints Required",
+    "sender_email": os.environ.get("SENDER_EMAIL", ""),
+    "sender_name": os.environ.get("SENDER_NAME", "Fingerprints Required"),
     "email_subject": "Your Fingerprint Release Form & Payment Code",
     "email_body": """Dear {first_name} {last_name},
 
@@ -740,25 +773,33 @@ def send_release_email(db, applicant_id):
     msg["To"] = a["email"]
     msg["Subject"] = subj
     msg["Reply-To"] = sender_email
-    msg["X-Mailer"] = "FP Release Manager"
-    msg["MIME-Version"] = "1.0"
-
-    # Create tracking token
-    tracking_token = str(uuid.uuid4())
-    # FIX: Derive base URL from ACCIO_POST_URL setting rather than hardcoding hostname
-    base_url = get_setting(db, "accio_post_url").rstrip("/").rsplit("/api/", 1)[0] if get_setting(db, "accio_post_url") else "https://fingerprint-release-manager1.onrender.com"
-    tracking_pixel = f'<img src="{base_url}/api/track/{tracking_token}" width="1" height="1" alt="" />'
+    # RFC 5322 required headers — missing these is a major spam signal
+    msg["Message-ID"] = make_msgid(domain=sender_email.split("@")[-1] if "@" in sender_email else "localhost")
+    msg["Date"] = formatdate(localtime=True)
+    # List-Unsubscribe — required by Gmail/Yahoo for bulk senders since Feb 2024.
+    # Points to Reply-To so recipients can request removal; prevents spam filtering.
+    msg["List-Unsubscribe"] = f"<mailto:{sender_email}?subject=unsubscribe>"
 
     alt_part = MIMEMultipart("alternative")
     alt_part.attach(MIMEText(body, "plain"))
 
+    company_name = get_setting(db, "company_name") or "BR Solutions"
     html_body = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
-<p>{h(body).replace(chr(10), '<br>')}</p>
-<p style="color: #666; font-size: 12px; margin-top: 30px;">This is an automated message from BR Solutions. Please do not reply directly to this email.</p>
-{tracking_pixel}
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0; padding:0; background-color:#f9f9f9;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f9f9f9;">
+<tr><td align="center" style="padding:20px 0;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:8px; overflow:hidden;">
+<tr><td style="padding:30px 40px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:1.6; color:#333333;">
+{h(body).replace(chr(10), '<br>')}
+</td></tr>
+<tr><td style="padding:15px 40px 25px; font-family:Arial, Helvetica, sans-serif; font-size:11px; color:#999999; border-top:1px solid #eeeeee;">
+This message was sent by {h(company_name)}. If you believe you received this email in error, please contact us at {h(sender_email)}.
+</td></tr>
+</table>
+</td></tr>
+</table>
 </body>
 </html>"""
 
@@ -778,7 +819,7 @@ def send_release_email(db, applicant_id):
         logger.info(f"SMTP: Connecting to {smtp_server}:{smtp_port} (TLS={use_tls})")
         logger.info(f"SMTP: From={sender_email}, To={a['email']}, User={smtp_user}")
         srv = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-        srv.set_debuglevel(1)
+        srv.set_debuglevel(0)  # Disabled — debuglevel=1 leaks SMTP credentials to logs
         if use_tls:
             srv.starttls()
             logger.info("SMTP: TLS established")
@@ -790,15 +831,9 @@ def send_release_email(db, applicant_id):
         srv.quit()
 
         now = datetime.now().isoformat()
-        cur = db.execute(
-            "INSERT INTO email_log (applicant_id,recipient_email,subject,status) VALUES (%s,%s,%s,'sent') RETURNING id",
-            (applicant_id, a["email"], subj)
-        )
-        email_log_id = cur.fetchone()["id"]
-
         db.execute(
-            "INSERT INTO email_tracking (applicant_id, email_log_id, tracking_token) VALUES (%s, %s, %s)",
-            (applicant_id, email_log_id, tracking_token)
+            "INSERT INTO email_log (applicant_id,recipient_email,subject,status) VALUES (%s,%s,%s,'sent')",
+            (applicant_id, a["email"], subj)
         )
 
         db.execute(
@@ -1421,7 +1456,7 @@ def page_applicants(db, params, nav_user=None):
     </div>
     <div class="card">
         <table>
-            <thead><tr><th>Status</th><th>Order #</th><th>Name</th><th>Email</th><th>Code</th><th>Email Opened</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Status</th><th>Order #</th><th>Name</th><th>Email</th><th>Code</th><th>Email Status</th><th>Actions</th></tr></thead>
             <tbody>
     """
 
@@ -1429,14 +1464,18 @@ def page_applicants(db, params, nav_user=None):
         email_status = ""
         if not r["email_sent"]:
             email_status = '<span class="email-status email-status-unsent"></span> Not Sent'
+        elif r["status"] == "email_failed":
+            email_status = '<span class="email-status" style="background:#dc2626;"></span> Failed'
         else:
-            opened = db.execute(
-                "SELECT COUNT(*) as cnt FROM email_tracking WHERE applicant_id = %s AND opened_at IS NOT NULL",
-                (r["id"],)
-            ).fetchone()["cnt"] > 0
-            email_status = ('<span class="email-status email-status-opened"></span> Yes'
-                            if opened else
-                            '<span class="email-status email-status-not-opened"></span> No')
+            sent_at = r.get("email_sent_at")
+            sent_label = ""
+            if sent_at:
+                try:
+                    dt = datetime.fromisoformat(str(sent_at)) if not isinstance(sent_at, datetime) else sent_at
+                    sent_label = f' <span style="color:#999;font-size:0.75rem;">({dt.strftime("%m/%d %I:%M%p").lower()})</span>'
+                except Exception:
+                    pass
+            email_status = f'<span class="email-status email-status-opened"></span> Sent{sent_label}'
 
         # Sanitize status value used in CSS class to prevent class injection
         safe_status = h(r['status']).replace(" ", "_")
@@ -2163,28 +2202,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, page_logs(db, nav_user=user))
 
             elif path.startswith("/api/track/"):
-                # Email open tracking pixel — no auth required (called by email clients)
-                token = path.split("/api/track/")[1].strip()
-                # Basic token format validation before hitting DB
-                if len(token) == 36 and token.count("-") == 4:
-                    try:
-                        db.execute(
-                            "UPDATE email_tracking SET opened_at=NOW(), open_count=open_count+1, user_agent=%s WHERE tracking_token=%s",
-                            (self.headers.get("User-Agent", "")[:500], token)
-                        )
-                        tracking = db.execute(
-                            "SELECT applicant_id FROM email_tracking WHERE tracking_token=%s",
-                            (token,)
-                        ).fetchone()
-                        if tracking:
-                            db.execute(
-                                "UPDATE applicants SET status='opened' WHERE id=%s AND status='emailed'",
-                                (tracking["applicant_id"],)
-                            )
-                    except Exception as e:
-                        logger.error(f"Tracking error: {e}")
-
-                # Return 1x1 transparent GIF regardless of token validity
+                # Legacy tracking pixel endpoint — kept alive so old emails don't
+                # produce broken-image icons, but no longer updates applicant status.
+                # Tracking pixels were removed from outgoing emails to improve
+                # deliverability (cross-domain image loads trigger spam filters).
                 gif = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x01\x0a\x00\x01\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x4d\x01\x00\x3b'
                 self.send_response(200)
                 self.send_header("Content-Type", "image/gif")
@@ -2324,8 +2345,8 @@ class Handler(BaseHTTPRequestHandler):
             # ---------------------------------------------------------------
             if path == "/api/accio-push":
                 try:
-                    ACCIO_USERNAME = os.environ.get("ACCIO_USERNAME", "admin")
-                    ACCIO_PASSWORD = os.environ.get("ACCIO_PASSWORD", "Fingerprint")
+                    ACCIO_USERNAME = get_setting(db, "accio_username") or os.environ.get("ACCIO_USERNAME", "")
+                    ACCIO_PASSWORD = get_setting(db, "accio_password") or os.environ.get("ACCIO_PASSWORD", "")
 
                     # FIX: Enforce maximum body size to prevent memory exhaustion
                     content_length = int(self.headers.get("Content-Length", 0))
@@ -2674,7 +2695,11 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT * FROM applicants WHERE status='pending' AND email IS NOT NULL AND email != ''"
                 ).fetchall()
                 succ, fail = 0, 0
-                for a in pending:
+                for i, a in enumerate(pending):
+                    # Throttle: 2-second delay between emails to avoid being
+                    # flagged as a spam bot by receiving mail servers.
+                    if i > 0:
+                        time.sleep(2)
                     c_val, _ = assign_code(db, a["id"])
                     if c_val:
                         ok, _ = send_release_email(db, a["id"])
@@ -2947,9 +2972,9 @@ if __name__ == "__main__":
     ║   Fingerprint Release Manager v2.0                       ║
     ║   Web UI:      http://localhost:{PORT}                     ║
     ║                                                          ║
-    ║   DEFAULT LOGIN:                                         ║
-    ║   Username: Brsolutions                                  ║
-    ║   Password: BRS#985!                                     ║
+    ║   LOGIN:                                                 ║
+    ║   Credentials loaded from environment variables          ║
+    ║   (DEFAULT_ADMIN_USER / DEFAULT_ADMIN_PASSWORD)          ║
     ║                                                          ║
     ║   AUTO-IMPORT:                                           ║
     ║   Drop .xlsx/.csv files into the 'watch/' folder         ║
@@ -2960,7 +2985,6 @@ if __name__ == "__main__":
     ║   POST /api/accio-push     (Accio Data XML results)      ║
     ║   POST /api/codes          (JSON: {{"codes":["..."]}} )    ║
     ║   POST /api/codes/upload   (Multipart file upload)       ║
-    ║   GET  /api/track/{{token}} (Email tracking pixel)        ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     server = HTTPServer((HOST, PORT), Handler)
