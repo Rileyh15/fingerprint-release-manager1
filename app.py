@@ -333,7 +333,7 @@ DEFAULT_SETTINGS = {
     "accio_account": os.environ.get("ACCIO_ACCOUNT", ""),
     "accio_username": os.environ.get("ACCIO_USERNAME", ""),
     "accio_password": os.environ.get("ACCIO_PASSWORD", ""),
-    "accio_post_url": os.environ.get("ACCIO_POST_URL", ""),
+    "accio_post_url": os.environ.get("ACCIO_POST_URL", "https://fingerprint-release-manager1.onrender.com/api/accio-push"),
     "accio_researcher_url": os.environ.get("ACCIO_RESEARCHER_URL", ""),
     "smtp_server": os.environ.get("SMTP_HOST", "smtp.gmail.com"),
     "smtp_port": os.environ.get("SMTP_PORT", "587"),
