@@ -1,8 +1,15 @@
 """
-Fingerprint Release Manager - v2.0
+Fingerprint Release Manager - v3.0 (SMS + Email)
 Integrates with Accio Data XML API to automate fingerprint release form distribution.
 
-New Features:
+New Features in v3.0:
+- SMS notifications via Twilio (texts applicants alongside email)
+- Dual-channel delivery: email + SMS sent automatically on code assignment
+- SMS logging and tracking (sms_log table)
+- Twilio configuration in Settings UI with test SMS
+- Phone number normalization for reliable SMS delivery
+
+Existing Features:
 - Multi-user login system with session management
 - Client tracking from Accio XML
 - Dashboard with analytics
@@ -15,9 +22,10 @@ Workflow:
 2. Manages a pool of IdentoGO one-time payment codes (imported from Excel)
 3. Assigns a code to each applicant
 4. Emails the applicant their fingerprint release form PDF with their assigned code
-5. Tracks email opens and applicant status
+5. Sends SMS to applicant with code, instructions, and scheduling info
+6. Tracks email opens, SMS delivery, and applicant status
 
-Built with Python standard library + openpyxl for Excel support.
+Built with Python standard library + openpyxl for Excel support + twilio for SMS.
 """
 
 import os
@@ -68,6 +76,14 @@ except ImportError:
     HAS_OPENPYXL = False
     print("WARNING: openpyxl not installed. Excel import will be limited to CSV only.")
     print("Install with: pip install openpyxl")
+
+try:
+    from twilio.rest import Client as TwilioClient
+    HAS_TWILIO = True
+except ImportError:
+    HAS_TWILIO = False
+    print("WARNING: twilio not installed. SMS notifications will be disabled.")
+    print("Install with: pip install twilio")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -181,7 +197,9 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW(),
             notes TEXT,
-            client_id INTEGER REFERENCES clients(id)
+            client_id INTEGER REFERENCES clients(id),
+            date_of_birth TEXT,
+            last_four_ssn VARCHAR(4)
         )
     """)
     db.execute("""
@@ -243,6 +261,20 @@ def init_db():
         )
     """)
 
+    # SMS log table — tracks all outbound text messages
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS sms_log (
+            id SERIAL PRIMARY KEY,
+            applicant_id INTEGER REFERENCES applicants(id),
+            recipient_phone TEXT,
+            message_body TEXT,
+            twilio_sid TEXT,
+            status TEXT,
+            error_message TEXT,
+            sent_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
     # Add new columns to existing tables if they don't exist
     try:
         db.execute("ALTER TABLE users ADD COLUMN recovery_email TEXT")
@@ -262,6 +294,26 @@ def init_db():
         db.execute("ALTER TABLE applicants ADD COLUMN accio_order_type TEXT")
     except psycopg2.Error:
         pass  # Column already exists
+
+    # LAPS integration columns: DOB for display/matching, last 4 SSN for matching
+    try:
+        db.execute("ALTER TABLE applicants ADD COLUMN date_of_birth TEXT")
+    except psycopg2.Error:
+        pass  # Column already exists
+    try:
+        db.execute("ALTER TABLE applicants ADD COLUMN last_four_ssn VARCHAR(4)")
+    except psycopg2.Error:
+        pass  # Column already exists
+
+    # Migration: add SMS tracking columns to applicants for existing databases
+    for col_sql in [
+        "ALTER TABLE applicants ADD COLUMN sms_sent BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE applicants ADD COLUMN sms_sent_at TIMESTAMP",
+    ]:
+        try:
+            db.execute(col_sql)
+        except psycopg2.Error:
+            pass  # Column already exists
 
     # Migration: add bot-detection columns to email_tracking for existing databases
     for col_sql in [
@@ -342,29 +394,47 @@ DEFAULT_SETTINGS = {
     "smtp_use_tls": os.environ.get("SMTP_USE_TLS", "1"),
     "sender_email": os.environ.get("SENDER_EMAIL", ""),
     "sender_name": os.environ.get("SENDER_NAME", "Fingerprints Required"),
-    "email_subject": "Your Fingerprint Release Form & Payment Code",
-    "email_body": """Dear {first_name} {last_name},
+    "email_subject": "Fingerprint Processing - Next Steps from {company_name}",
+    "email_body": """Hello {first_name} {last_name},
 
-Please find attached your Fingerprint Release Form for processing.
+Thank you for working with {company_name}. Please see the attached form regarding your upcoming fingerprint appointment.
 
-Your one-time IdentoGO payment code is: {code}
+Your IdentoGO reference code: {code}
 
-This code covers the cost of your fingerprint processing. When you visit the IdentoGO location, provide this code so that the fee is charged to our company account. Do NOT pay out of pocket.
+Please bring this code to your IdentoGO appointment. The processing fee has already been covered on your behalf -- simply present the code above when you arrive.
 
-Instructions:
-1. Download and review the attached Fingerprint Release Form
+Steps to complete:
+1. Review the attached Fingerprint Release Form
 2. Visit your assigned IdentoGO location
-3. When prompted for payment, enter code: {code}
+3. Present your reference code: {code}
 4. Complete the fingerprinting process
 
-If you have any questions, please contact us.
+If you have any questions, feel free to reach out to us directly.
 
-Thank you.""",
+Best regards,
+{company_name}""",
     "release_form_path": "",
     "company_name": "Background Research Solutions, LLC",
     "ori_number": "",
     "auto_assign_codes": "1",
     "auto_send_email": "1",
+    # --- SMS / Twilio Settings ---
+    "twilio_account_sid": os.environ.get("TWILIO_ACCOUNT_SID", ""),
+    "twilio_auth_token": os.environ.get("TWILIO_AUTH_TOKEN", ""),
+    "twilio_from_number": os.environ.get("TWILIO_FROM_NUMBER", ""),
+    "auto_send_sms": "1",
+    "sms_body": """Hello {first_name} {last_name}, this is {company_name}. Your fingerprint appointment is ready!
+
+Your IdentoGO code: {code}
+
+Steps:
+1. Visit your assigned IdentoGO location
+2. Present code: {code}
+3. The processing fee is already covered
+
+Questions? Reply to this text or contact us directly.
+
+- {company_name}""",
 }
 
 
@@ -501,11 +571,14 @@ def parse_accio_xml(xml_string):
             last = _xt(subject, "name_last")
             email = _xt(subject, "email")
             phone = _xt(subject, "phone")
+            dob = _extract_dob(subject)
+            ssn4 = _extract_ssn_last4(subject)
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_number, company_name="",
-                                       accio_sub_order=sub_order_id, accio_order_type=order_type))
+                                       accio_sub_order=sub_order_id, accio_order_type=order_type,
+                                       date_of_birth=dob, last_four_ssn=ssn4))
 
     for po in root.iter("placeOrder"):
         company_name = ""
@@ -541,12 +614,15 @@ def parse_accio_xml(xml_string):
             last = _xt(subject, "name_last")
             email = _xt(subject, "email") or oi_email
             phone = _xt(subject, "phone") or oi_phone
+            dob = _extract_dob(subject)
+            ssn4 = _extract_ssn_last4(subject)
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=po.get("number", ""),
                                        accio_remote_number="", company_name=company_name,
                                        account_name=account_name,
-                                       accio_sub_order=sub_order_id, accio_order_type=order_type))
+                                       accio_sub_order=sub_order_id, accio_order_type=order_type,
+                                       date_of_birth=dob, last_four_ssn=ssn4))
 
     # --- Format 2: Action Letter XML Post (postLetter with orderInfo) ---
     for post_letter in root.iter("postLetter"):
@@ -561,6 +637,8 @@ def parse_accio_xml(xml_string):
             last = _xt(order_info, "name_last")
             email = _xt(order_info, "email")
             phone = _xt(order_info, "phone_number") or _xt(order_info, "phone")
+            dob = _extract_dob(order_info)
+            ssn4 = _extract_ssn_last4(order_info)
             if not email:
                 email = _xt(order_info, "requester_email")
             if not phone:
@@ -570,7 +648,8 @@ def parse_accio_xml(xml_string):
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_order, company_name="",
                                        account_name="",
-                                       accio_sub_order=sub_order_id, accio_order_type=order_type))
+                                       accio_sub_order=sub_order_id, accio_order_type=order_type,
+                                       date_of_birth=dob, last_four_ssn=ssn4))
 
     # --- Format 3: Vendor dispatch XML (orderRequest with subject) ---
     for order_req in root.iter("orderRequest"):
@@ -584,12 +663,15 @@ def parse_accio_xml(xml_string):
             last = _xt(subject, "name_last") or _xt(subject, "lastName")
             email = _xt(subject, "email") or _xt(subject, "InternetEmailAddress")
             phone = _xt(subject, "phone") or _xt(subject, "phone_number")
+            dob = _extract_dob(subject)
+            ssn4 = _extract_ssn_last4(subject)
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_number, company_name="",
                                        account_name="",
-                                       accio_sub_order=sub_order_id, accio_order_type=order_type))
+                                       accio_sub_order=sub_order_id, accio_order_type=order_type,
+                                       date_of_birth=dob, last_four_ssn=ssn4))
 
     # --- Format 4: Generic fallback - PersonalData or BackgroundSearchPackage ---
     if not applicants:
@@ -597,16 +679,21 @@ def parse_accio_xml(xml_string):
             pn = pd.find("PersonName")
             cm = pd.find("ContactMethod")
             first = last = email = phone = ""
+            dob = _extract_dob(pd)
+            ssn4 = _extract_ssn_last4(pd)
             if pn is not None:
                 first = _xt(pn, "GivenName") or _xt(pn, "name_first")
                 last = _xt(pn, "FamilyName") or _xt(pn, "name_last")
+                if not dob:
+                    dob = _extract_dob(pn)
             if cm is not None:
                 email = _xt(cm, "InternetEmailAddress") or _xt(cm, "email")
                 phone = _xt(cm, "FormattedNumber") or _xt(cm, "phone")
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number="",
-                                       accio_remote_number="", company_name="", account_name=""))
+                                       accio_remote_number="", company_name="", account_name="",
+                                       date_of_birth=dob, last_four_ssn=ssn4))
 
     # --- Format 5: AccioOrder XML (placeOrder > subject, email in orderInfo) ---
     if not applicants:
@@ -653,6 +740,8 @@ def parse_accio_xml(xml_string):
                          _xt(subject, "FormattedNumber") or _xt(subject, "telephone") or
                          _xt(subject, "contact_phone") or _xt(subject, "home_phone") or
                          _xt(subject, "cell_phone") or _xt(subject, "mobile"))
+                dob = _extract_dob(subject)
+                ssn4 = _extract_ssn_last4(subject)
                 if not email:
                     email = order_email
                 if not phone:
@@ -662,7 +751,8 @@ def parse_accio_xml(xml_string):
                                            phone=phone, accio_order_number=order_number,
                                            accio_remote_number="", company_name=company_name,
                                            account_name=account_name,
-                                           accio_sub_order=sub_order_id, accio_order_type=order_type))
+                                           accio_sub_order=sub_order_id, accio_order_type=order_type,
+                                           date_of_birth=dob, last_four_ssn=ssn4))
 
     # --- Format 5b: <order> tag (older AccioOrder variants) ---
     if not applicants:
@@ -686,6 +776,8 @@ def parse_accio_xml(xml_string):
                 phone = (_xt(subject, "phone") or _xt(subject, "Phone") or
                          _xt(subject, "phone_number") or _xt(subject, "FormattedNumber") or
                          _xt(subject, "contact_phone"))
+                dob = _extract_dob(subject)
+                ssn4 = _extract_ssn_last4(subject)
                 if not email:
                     email = order_email
                 if not phone:
@@ -695,7 +787,8 @@ def parse_accio_xml(xml_string):
                                            phone=phone, accio_order_number=order_number,
                                            accio_remote_number=remote_number, company_name="",
                                            account_name="",
-                                           accio_sub_order=sub_order_id, accio_order_type=order_type))
+                                           accio_sub_order=sub_order_id, accio_order_type=order_type,
+                                           date_of_birth=dob, last_four_ssn=ssn4))
 
     # --- Deep scan fallback ---
     if not applicants:
@@ -721,11 +814,14 @@ def parse_accio_xml(xml_string):
                             phone = _xt(parent, tag)
                             if phone:
                                 break
+                        dob = _extract_dob(parent) if parent is not None else ""
+                        ssn4 = _extract_ssn_last4(parent) if parent is not None else ""
                         if first or last:
                             found.append(dict(first_name=first, last_name=last, email=email,
                                               phone=phone, accio_order_number="",
                                               accio_remote_number="", company_name="",
-                                              account_name=""))
+                                              account_name="",
+                                              date_of_birth=dob, last_four_ssn=ssn4))
             return found
         applicants = deep_scan_for_applicants(root)
 
@@ -735,6 +831,59 @@ def parse_accio_xml(xml_string):
 def _xt(el, tag):
     c = el.find(tag)
     return c.text.strip() if c is not None and c.text else ""
+
+
+def _extract_dob(subject_el):
+    """
+    Extract date of birth from an XML subject element.
+    Accio XML may use: dob, DOB, date_of_birth, DateOfBirth, birthDate, birth_date.
+    Accio format is YYYYMMDD (e.g., 19850315) but we also handle YYYY-MM-DD and MM/DD/YYYY.
+    Returns formatted string "MM/DD/YYYY" for display, or empty string.
+    """
+    import re as _re
+    raw = ""
+    for tag in ["dob", "DOB", "date_of_birth", "DateOfBirth", "birthDate", "birth_date",
+                "BirthDate", "dateOfBirth"]:
+        raw = _xt(subject_el, tag)
+        if raw:
+            break
+    if not raw:
+        return ""
+    raw = raw.strip()
+    # Format: YYYYMMDD (Accio standard)
+    if _re.match(r"^\d{8}$", raw):
+        return f"{raw[4:6]}/{raw[6:8]}/{raw[0:4]}"
+    # Format: YYYY-MM-DD
+    if _re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        parts = raw.split("-")
+        return f"{parts[1]}/{parts[2]}/{parts[0]}"
+    # Format: MM/DD/YYYY (already correct)
+    if _re.match(r"^\d{2}/\d{2}/\d{4}$", raw):
+        return raw
+    return raw  # Return as-is if unrecognized format
+
+
+def _extract_ssn_last4(subject_el):
+    """
+    Extract last 4 digits of SSN from an XML subject element.
+    Accio XML SSN format is 9 digits, no dashes (e.g., 123456789).
+    Also handles XXX-XX-XXXX format. Returns last 4 digits or empty string.
+    SECURITY: Only the last 4 digits are stored. Full SSN is never persisted.
+    """
+    import re as _re
+    raw = ""
+    for tag in ["ssn", "SSN", "social_security", "SocialSecurityNumber",
+                "social_security_number", "ssn_number"]:
+        raw = _xt(subject_el, tag)
+        if raw:
+            break
+    if not raw:
+        return ""
+    # Strip dashes and spaces
+    digits_only = _re.sub(r"[^0-9]", "", raw)
+    if len(digits_only) >= 4:
+        return digits_only[-4:]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +1020,106 @@ This message was sent by {h(company_name)}. If you believe you received this ema
         return False, str(e)
 
 
+# ---------------------------------------------------------------------------
+# SMS (Twilio)
+# ---------------------------------------------------------------------------
+def normalize_phone(raw_phone):
+    """Normalize a US phone number to E.164 format (+1XXXXXXXXXX).
+
+    Handles common formats from Accio XML:
+      (225) 555-1234, 225-555-1234, 2255551234, +12255551234, 1-225-555-1234
+    Returns None if the number can't be normalized to a valid 10-digit US number.
+    """
+    if not raw_phone:
+        return None
+    digits = re.sub(r"[^\d]", "", raw_phone)
+    # Strip leading country code '1' if present (11 digits starting with 1)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return None
+    return f"+1{digits}"
+
+
+def send_release_sms(db, applicant_id):
+    """Send an SMS to the applicant with their fingerprint release info via Twilio.
+
+    Mirrors the email workflow: builds the message from the sms_body template,
+    sends via Twilio REST API, logs to sms_log, and updates the applicant record.
+    Returns (success: bool, message: str).
+    """
+    if not HAS_TWILIO:
+        return False, "Twilio library not installed. Run: pip install twilio"
+
+    a = db.execute("SELECT * FROM applicants WHERE id = %s", (applicant_id,)).fetchone()
+    if not a:
+        return False, "Applicant not found"
+    if not a["phone"]:
+        return False, "No phone number on file"
+    if not a["assigned_code"]:
+        return False, "No code assigned"
+
+    # Normalize phone to E.164
+    to_number = normalize_phone(a["phone"])
+    if not to_number:
+        return False, f"Invalid phone number: {a['phone']} (must be 10-digit US number)"
+
+    # Load Twilio credentials
+    account_sid = get_setting(db, "twilio_account_sid").strip()
+    auth_token = get_setting(db, "twilio_auth_token").strip()
+    from_number = get_setting(db, "twilio_from_number").strip()
+
+    if not account_sid or not auth_token or not from_number:
+        return False, "Twilio not configured. Go to Settings > SMS Configuration."
+
+    # Build message body from template
+    reps = dict(
+        first_name=a["first_name"],
+        last_name=a["last_name"],
+        email=a.get("email", ""),
+        code=a["assigned_code"],
+        company_name=get_setting(db, "company_name"),
+        ori_number=get_setting(db, "ori_number"),
+    )
+    try:
+        body = get_setting(db, "sms_body").format(**reps)
+    except (KeyError, ValueError) as fmt_err:
+        return False, f"SMS template error: {fmt_err}"
+
+    try:
+        logger.info(f"SMS: Sending to {to_number} from {from_number}")
+        client = TwilioClient(account_sid, auth_token)
+        message = client.messages.create(
+            body=body,
+            from_=from_number,
+            to=to_number
+        )
+        logger.info(f"SMS: Sent successfully, SID={message.sid}, Status={message.status}")
+
+        now = datetime.now().isoformat()
+        db.execute(
+            "INSERT INTO sms_log (applicant_id,recipient_phone,message_body,twilio_sid,status) "
+            "VALUES (%s,%s,%s,%s,%s)",
+            (applicant_id, to_number, body, message.sid, message.status)
+        )
+        db.execute(
+            "UPDATE applicants SET sms_sent=TRUE, sms_sent_at=%s, updated_at=%s WHERE id = %s",
+            (now, now, applicant_id)
+        )
+        db.commit()
+        return True, f"SMS sent (SID: {message.sid})"
+
+    except Exception as e:
+        logger.error(f"SMS FAILED: {type(e).__name__}: {e}")
+        db.execute(
+            "INSERT INTO sms_log (applicant_id,recipient_phone,message_body,status,error_message) "
+            "VALUES (%s,%s,%s,'failed',%s)",
+            (applicant_id, to_number, body, str(e))
+        )
+        db.commit()
+        return False, str(e)
+
+
 def post_accio_result(db, applicant_id):
     """Post a status note back to Accio's researcherxml endpoint.
 
@@ -900,9 +1149,13 @@ def post_accio_result(db, applicant_id):
     assigned_code  = (a.get("assigned_code") or "").strip()
 
     sent_at = datetime.now(tz=ZoneInfo("America/Chicago")).strftime("%m/%d/%Y %I:%M %p CST")
+    # Check if SMS was also sent for this applicant
+    sms_status = ""
+    if a.get("sms_sent"):
+        sms_status = " SMS also sent."
     note_text = (
         f"FP Release email sent on {sent_at}. "
-        f"Assigned fingerprint code: {assigned_code}"
+        f"Assigned fingerprint code: {assigned_code}.{sms_status}"
     )
 
     # Build postResults XML per Ch 9 / Ch 11 of Accio Data XML Integration Manual.
@@ -1154,83 +1407,152 @@ def render_page(title, content, active="", user=None):
         <title>{h(title)} - Fingerprint Release Manager</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
         <style>
+            /* === FUTURISTIC DARK THEME — FP Release v3.0 === */
             :root {{
-                --primary: #2563eb;
-                --primary-dark: #1e40af;
-                --success: #10b981;
-                --danger: #ef4444;
-                --warning: #f59e0b;
-                --gray-50: #f9fafb;
-                --gray-100: #f3f4f6;
-                --gray-200: #e5e7eb;
-                --gray-300: #d1d5db;
-                --gray-400: #9ca3af;
-                --gray-500: #6b7280;
-                --gray-700: #374151;
-                --gray-900: #111827;
+                --primary: #00d4ff;           /* Electric cyan accent */
+                --primary-dark: #00a8cc;
+                --primary-glow: rgba(0, 212, 255, 0.15);
+                --accent-purple: #a855f7;     /* Neon purple secondary */
+                --accent-teal: #2dd4bf;        /* Soft teal highlight */
+                --success: #00e68a;
+                --danger: #ff4d6a;
+                --warning: #ffb020;
+                --surface-0: #0a0e1a;         /* Deepest background */
+                --surface-1: #111827;         /* Sidebar / panels */
+                --surface-2: #1a2035;         /* Cards */
+                --surface-3: #222b45;         /* Elevated surfaces */
+                --glass: rgba(26, 32, 53, 0.65); /* Glassmorphism base */
+                --glass-border: rgba(0, 212, 255, 0.12);
+                --border: rgba(255,255,255,0.06);
+                --border-hover: rgba(0, 212, 255, 0.25);
+                --text-primary: #e8ecf4;
+                --text-secondary: #8892a8;
+                --text-muted: #5a6478;
+                /* Legacy aliases for inline styles that reference old vars */
+                --gray-50: var(--surface-3);
+                --gray-100: var(--surface-2);
+                --gray-200: var(--border);
+                --gray-300: var(--text-muted);
+                --gray-400: var(--text-secondary);
+                --gray-500: var(--text-secondary);
+                --gray-700: var(--text-secondary);
+                --gray-900: var(--text-primary);
             }}
             * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--gray-50); color: var(--gray-900); }}
+            body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--surface-0); color: var(--text-primary); letter-spacing: 0.01em; }}
+
+            /* --- Layout --- */
             .container {{ display: flex; min-height: 100vh; }}
-            .sidebar {{ width: 250px; background: var(--gray-900); color: white; padding: 2rem 0; overflow-y: auto; box-shadow: 2px 0 8px rgba(0,0,0,0.1); }}
-            .sidebar-brand {{ padding: 0 1.5rem 2rem; font-size: 1.5rem; font-weight: bold; display: flex; align-items: center; gap: 0.5rem; border-bottom: 1px solid var(--gray-700); }}
-            .sidebar-brand i {{ color: var(--primary); }}
+
+            /* --- Sidebar: matte dark with subtle glow accents --- */
+            .sidebar {{ width: 250px; background: linear-gradient(180deg, var(--surface-1) 0%, #0d1225 100%); color: white; padding: 2rem 0; overflow-y: auto; box-shadow: 2px 0 20px rgba(0,0,0,0.4); border-right: 1px solid var(--glass-border); position: relative; }}
+            .sidebar::after {{ content: ''; position: absolute; top: 0; right: 0; width: 1px; height: 100%; background: linear-gradient(180deg, var(--primary) 0%, transparent 50%, var(--accent-purple) 100%); opacity: 0.3; }}
+            .sidebar-brand {{ padding: 0 1.5rem 2rem; font-size: 1.5rem; font-weight: bold; display: flex; align-items: center; gap: 0.5rem; border-bottom: 1px solid rgba(255,255,255,0.06); }}
+            .sidebar-brand i {{ color: var(--primary); filter: drop-shadow(0 0 6px rgba(0, 212, 255, 0.5)); }}
+            .sidebar-brand span {{ background: linear-gradient(135deg, var(--primary), var(--accent-purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }}
             .sidebar-nav {{ list-style: none; padding: 1rem 0; }}
             .sidebar-nav li {{ margin: 0; }}
-            .sidebar-nav a {{ display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.5rem; color: var(--gray-300); text-decoration: none; transition: all 0.2s; }}
-            .sidebar-nav a:hover {{ color: white; background: rgba(37, 99, 235, 0.1); padding-left: 1.75rem; }}
-            .sidebar-nav a.active {{ color: var(--primary); background: rgba(37, 99, 235, 0.1); border-left: 3px solid var(--primary); padding-left: 1.5rem; }}
-            .main {{ flex: 1; display: flex; flex-direction: column; }}
-            .topbar {{ background: white; padding: 1rem 2rem; border-bottom: 1px solid var(--gray-200); display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-            .topbar-user {{ display: flex; align-items: center; gap: 1rem; }}
-            .topbar-user a {{ color: var(--primary); text-decoration: none; font-size: 0.875rem; }}
-            .topbar-user a:hover {{ text-decoration: underline; }}
+            .sidebar-nav a {{ display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.5rem; color: var(--text-secondary); text-decoration: none; transition: all 0.3s ease; border-left: 3px solid transparent; }}
+            .sidebar-nav a:hover {{ color: var(--primary); background: var(--primary-glow); padding-left: 1.75rem; }}
+            .sidebar-nav a.active {{ color: var(--primary); background: var(--primary-glow); border-left: 3px solid var(--primary); padding-left: 1.5rem; box-shadow: inset 0 0 20px rgba(0,212,255,0.05); }}
+            .sidebar-nav a.active i {{ filter: drop-shadow(0 0 4px rgba(0, 212, 255, 0.4)); }}
+
+            /* --- Main content area --- */
+            .main {{ flex: 1; display: flex; flex-direction: column; background: var(--surface-0); }}
+
+            /* --- Top bar: frosted glass --- */
+            .topbar {{ background: var(--glass); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); padding: 1rem 2rem; border-bottom: 1px solid var(--glass-border); display: flex; justify-content: space-between; align-items: center; }}
+            .topbar-user {{ display: flex; align-items: center; gap: 1rem; color: var(--text-secondary); }}
+            .topbar-user a {{ color: var(--primary); text-decoration: none; font-size: 0.875rem; transition: all 0.2s; }}
+            .topbar-user a:hover {{ color: var(--accent-teal); text-shadow: 0 0 8px rgba(0,212,255,0.3); }}
+
             .content {{ flex: 1; overflow-y: auto; padding: 2rem; }}
-            .page-title {{ font-size: 2rem; font-weight: bold; margin-bottom: 1.5rem; color: var(--gray-900); }}
-            .alert {{ padding: 1rem; border-radius: 0.5rem; margin-bottom: 1rem; display: flex; gap: 0.75rem; align-items: flex-start; }}
-            .alert-success {{ background: rgba(16, 185, 129, 0.1); border: 1px solid var(--success); color: var(--success); }}
-            .alert-error {{ background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }}
-            .card {{ background: white; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 1.5rem; margin-bottom: 1.5rem; }}
-            .card-title {{ font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }}
-            .card-title i {{ color: var(--primary); }}
+            .page-title {{ font-size: 2rem; font-weight: bold; margin-bottom: 1.5rem; color: var(--text-primary); letter-spacing: 0.02em; }}
+            .page-title i {{ color: var(--primary); filter: drop-shadow(0 0 8px rgba(0,212,255,0.4)); }}
+
+            /* --- Alerts with glow borders --- */
+            .alert {{ padding: 1rem; border-radius: 0.75rem; margin-bottom: 1rem; display: flex; gap: 0.75rem; align-items: flex-start; backdrop-filter: blur(8px); }}
+            .alert-success {{ background: rgba(0, 230, 138, 0.08); border: 1px solid rgba(0,230,138,0.3); color: var(--success); box-shadow: 0 0 15px rgba(0,230,138,0.05); }}
+            .alert-error {{ background: rgba(255, 77, 106, 0.08); border: 1px solid rgba(255,77,106,0.3); color: var(--danger); box-shadow: 0 0 15px rgba(255,77,106,0.05); }}
+
+            /* --- Cards: glassmorphism with 3D depth --- */
+            .card {{ background: var(--glass); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid var(--glass-border); border-radius: 0.75rem; box-shadow: 0 4px 24px rgba(0,0,0,0.3), 0 1px 0 rgba(255,255,255,0.03) inset; padding: 1.5rem; margin-bottom: 1.5rem; transition: border-color 0.3s ease, box-shadow 0.3s ease; }}
+            .card:hover {{ border-color: var(--border-hover); box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 20px rgba(0,212,255,0.03); }}
+            .card-title {{ font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; color: var(--text-primary); }}
+            .card-title i {{ color: var(--primary); filter: drop-shadow(0 0 4px rgba(0,212,255,0.3)); }}
+
+            /* --- Stat cards: elevated with subtle inner glow --- */
             .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }}
-            .stat-card {{ background: white; border-radius: 0.5rem; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); text-align: center; }}
-            .stat-value {{ font-size: 2rem; font-weight: bold; color: var(--primary); margin: 0.5rem 0; }}
-            .stat-label {{ color: var(--gray-500); font-size: 0.875rem; }}
-            .stat-icon {{ font-size: 2rem; color: var(--primary); margin-bottom: 0.5rem; opacity: 0.7; }}
+            .stat-card {{ background: linear-gradient(145deg, var(--surface-2), var(--surface-3)); border: 1px solid var(--glass-border); border-radius: 0.75rem; padding: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.04); text-align: center; transition: transform 0.3s ease, box-shadow 0.3s ease; }}
+            .stat-card:hover {{ transform: translateY(-2px); box-shadow: 0 8px 30px rgba(0,0,0,0.35), 0 0 20px rgba(0,212,255,0.06); }}
+            .stat-value {{ font-size: 2rem; font-weight: bold; color: var(--primary); margin: 0.5rem 0; text-shadow: 0 0 20px rgba(0,212,255,0.2); }}
+            .stat-label {{ color: var(--text-secondary); font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+            .stat-icon {{ font-size: 2rem; color: var(--primary); margin-bottom: 0.5rem; opacity: 0.7; filter: drop-shadow(0 0 6px rgba(0,212,255,0.3)); }}
+
+            /* --- Tables: dark rows with cyan accent lines --- */
             table {{ width: 100%; border-collapse: collapse; margin-bottom: 1rem; }}
-            thead {{ background: var(--gray-100); border-bottom: 2px solid var(--gray-200); }}
-            th {{ padding: 0.75rem; text-align: left; font-weight: 600; color: var(--gray-700); font-size: 0.875rem; }}
-            td {{ padding: 0.75rem; border-bottom: 1px solid var(--gray-200); }}
-            tbody tr:hover {{ background: var(--gray-50); }}
-            .btn {{ padding: 0.5rem 1rem; border: none; border-radius: 0.375rem; font-size: 0.875rem; font-weight: 500; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem; transition: all 0.2s; }}
-            .btn-primary {{ background: var(--primary); color: white; }}
-            .btn-primary:hover {{ background: var(--primary-dark); }}
-            .btn-success {{ background: var(--success); color: white; }}
-            .btn-success:hover {{ background: #059669; }}
-            .btn-danger {{ background: var(--danger); color: white; }}
-            .btn-danger:hover {{ background: #dc2626; }}
+            thead {{ background: rgba(0, 212, 255, 0.04); border-bottom: 2px solid rgba(0,212,255,0.15); }}
+            th {{ padding: 0.75rem; text-align: left; font-weight: 600; color: var(--text-secondary); font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.04em; }}
+            td {{ padding: 0.75rem; border-bottom: 1px solid var(--border); color: var(--text-primary); }}
+            tbody tr {{ transition: background 0.2s ease; }}
+            tbody tr:hover {{ background: rgba(0, 212, 255, 0.04); }}
+
+            /* --- Buttons: gradient fills with glow on hover --- */
+            .btn {{ padding: 0.5rem 1rem; border: none; border-radius: 0.5rem; font-size: 0.875rem; font-weight: 500; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem; transition: all 0.3s ease; }}
+            .btn-primary {{ background: linear-gradient(135deg, var(--primary), #0099cc); color: #0a0e1a; font-weight: 600; }}
+            .btn-primary:hover {{ box-shadow: 0 0 20px rgba(0,212,255,0.3); transform: translateY(-1px); }}
+            .btn-success {{ background: linear-gradient(135deg, var(--success), #00b36b); color: #0a0e1a; font-weight: 600; }}
+            .btn-success:hover {{ box-shadow: 0 0 20px rgba(0,230,138,0.3); transform: translateY(-1px); }}
+            .btn-danger {{ background: linear-gradient(135deg, var(--danger), #cc2244); color: white; }}
+            .btn-danger:hover {{ box-shadow: 0 0 20px rgba(255,77,106,0.3); transform: translateY(-1px); }}
             .btn-small {{ padding: 0.25rem 0.75rem; font-size: 0.75rem; }}
+
+            /* --- Forms: dark inputs with glow focus --- */
             .form-group {{ margin-bottom: 1.5rem; }}
-            label {{ display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--gray-700); }}
-            input[type="text"], input[type="email"], input[type="password"], input[type="number"], select, textarea {{ width: 100%; padding: 0.5rem; border: 1px solid var(--gray-300); border-radius: 0.375rem; font-size: 0.875rem; font-family: inherit; }}
-            input:focus, select:focus, textarea:focus {{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }}
-            .status-badge {{ display: inline-block; padding: 0.25rem 0.75rem; border-radius: 1rem; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }}
-            .status-pending {{ background: rgba(239, 68, 68, 0.1); color: var(--danger); }}
-            .status-code_assigned {{ background: rgba(245, 158, 11, 0.1); color: var(--warning); }}
-            .status-emailed {{ background: rgba(59, 130, 246, 0.1); color: var(--primary); }}
-            .status-opened {{ background: rgba(16, 185, 129, 0.1); color: var(--success); }}
-            .status-completed {{ background: rgba(16, 185, 129, 0.1); color: var(--success); }}
-            .status-email_failed {{ background: rgba(220, 38, 38, 0.15); color: #dc2626; border: 1px solid rgba(220, 38, 38, 0.3); animation: pulse-fail 2s ease-in-out infinite; }}
-            @keyframes pulse-fail {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} }}
+            label {{ display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--text-secondary); }}
+            input[type="text"], input[type="email"], input[type="password"], input[type="number"], select, textarea {{ width: 100%; padding: 0.625rem 0.75rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 0.5rem; font-size: 0.875rem; font-family: inherit; background: var(--surface-1); color: var(--text-primary); transition: all 0.3s ease; }}
+            input:focus, select:focus, textarea:focus {{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,212,255,0.1), 0 0 15px rgba(0,212,255,0.05); background: var(--surface-2); }}
+            input::placeholder, textarea::placeholder {{ color: var(--text-muted); }}
+
+            /* --- Status badges: glowing pill indicators --- */
+            .status-badge {{ display: inline-block; padding: 0.25rem 0.75rem; border-radius: 1rem; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }}
+            .status-pending {{ background: rgba(255, 77, 106, 0.12); color: var(--danger); border: 1px solid rgba(255,77,106,0.2); }}
+            .status-code_assigned {{ background: rgba(255, 176, 32, 0.12); color: var(--warning); border: 1px solid rgba(255,176,32,0.2); }}
+            .status-emailed {{ background: rgba(0, 212, 255, 0.12); color: var(--primary); border: 1px solid rgba(0,212,255,0.2); }}
+            .status-opened {{ background: rgba(0, 230, 138, 0.12); color: var(--success); border: 1px solid rgba(0,230,138,0.2); }}
+            .status-completed {{ background: rgba(0, 230, 138, 0.12); color: var(--success); border: 1px solid rgba(0,230,138,0.2); }}
+            .status-email_failed {{ background: rgba(255, 77, 106, 0.15); color: var(--danger); border: 1px solid rgba(255,77,106,0.3); animation: pulse-fail 2s ease-in-out infinite; }}
+            @keyframes pulse-fail {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.6; }} }}
+
+            /* --- Email status dots with glow --- */
             .email-status {{ display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 0.25rem; }}
-            .email-status-opened {{ background: var(--success); }}
-            .email-status-not-opened {{ background: var(--danger); }}
-            .email-status-unsent {{ background: var(--gray-300); }}
+            .email-status-opened {{ background: var(--success); box-shadow: 0 0 6px rgba(0,230,138,0.4); }}
+            .email-status-not-opened {{ background: var(--danger); box-shadow: 0 0 6px rgba(255,77,106,0.4); }}
+            .email-status-unsent {{ background: var(--text-muted); }}
+
             .es {{ text-align: center; padding: 3rem; }}
-            .es i {{ font-size: 4rem; color: var(--gray-300); margin-bottom: 1rem; }}
-            .es h3 {{ color: var(--gray-500); }}
+            .es i {{ font-size: 4rem; color: var(--text-muted); margin-bottom: 1rem; }}
+            .es h3 {{ color: var(--text-secondary); }}
             .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }}
+
+            /* --- Code elements: monospace with subtle highlight --- */
+            code {{ background: rgba(0,212,255,0.06); border: 1px solid rgba(0,212,255,0.1); border-radius: 0.25rem; padding: 0.1rem 0.4rem; font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace; color: var(--accent-teal); }}
+
+            /* --- Links --- */
+            a {{ color: var(--primary); transition: color 0.2s ease; }}
+            a:hover {{ color: var(--accent-teal); }}
+
+            /* --- Scrollbar: thin dark with cyan thumb --- */
+            ::-webkit-scrollbar {{ width: 6px; }}
+            ::-webkit-scrollbar-track {{ background: var(--surface-0); }}
+            ::-webkit-scrollbar-thumb {{ background: rgba(0,212,255,0.2); border-radius: 3px; }}
+            ::-webkit-scrollbar-thumb:hover {{ background: rgba(0,212,255,0.35); }}
+
+            /* --- Subtle ambient glow animation on sidebar brand icon --- */
+            @keyframes glow-pulse {{ 0%, 100% {{ filter: drop-shadow(0 0 6px rgba(0,212,255,0.5)); }} 50% {{ filter: drop-shadow(0 0 12px rgba(0,212,255,0.8)); }} }}
+            .sidebar-brand i {{ animation: glow-pulse 3s ease-in-out infinite; }}
+
+            /* --- Responsive --- */
             @media (max-width: 768px) {{
                 .container {{ flex-direction: column; }}
                 .sidebar {{ width: 100%; padding: 1rem 0; }}
@@ -1291,21 +1613,24 @@ def page_login(error=""):
         <title>Login - Fingerprint Release Manager</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
         <style>
-            :root {{ --primary: #2563eb; --gray-50: #f9fafb; --gray-200: #e5e7eb; --gray-400: #9ca3af; --gray-700: #374151; --gray-900: #111827; }}
+            @keyframes glow-pulse {{ 0%, 100% {{ filter: drop-shadow(0 0 8px rgba(0, 212, 255, 0.6)); }} 50% {{ filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.9)); }} }}
+            @keyframes float-in {{ from {{ opacity: 0; transform: translateY(20px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+            :root {{ --primary: #00d4ff; --accent-purple: #a855f7; --surface-0: #0a0e1a; --surface-1: rgba(15, 23, 42, 0.85); --text-primary: #e2e8f0; --text-muted: #64748b; }}
             * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(135deg, var(--primary) 0%, #1e40af 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
-            .login-card {{ background: white; border-radius: 0.5rem; box-shadow: 0 10px 25px rgba(0,0,0,0.2); padding: 3rem; width: 100%; max-width: 400px; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--surface-0); background-image: radial-gradient(ellipse at 20% 50%, rgba(0, 212, 255, 0.08) 0%, transparent 50%), radial-gradient(ellipse at 80% 50%, rgba(168, 85, 247, 0.06) 0%, transparent 50%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+            .login-card {{ background: var(--surface-1); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(0, 212, 255, 0.15); border-radius: 1rem; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5), 0 0 60px rgba(0, 212, 255, 0.05); padding: 3rem; width: 100%; max-width: 420px; animation: float-in 0.6s ease-out; }}
             .login-brand {{ text-align: center; margin-bottom: 2rem; }}
-            .login-brand i {{ font-size: 3rem; color: var(--primary); margin-bottom: 0.5rem; }}
-            .login-brand h1 {{ font-size: 1.5rem; color: var(--gray-900); margin: 0; }}
-            .login-brand p {{ color: var(--gray-400); margin: 0.5rem 0 0 0; font-size: 0.875rem; }}
+            .login-brand i {{ font-size: 3rem; background: linear-gradient(135deg, var(--primary), var(--accent-purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 0.5rem; animation: glow-pulse 3s ease-in-out infinite; }}
+            .login-brand h1 {{ font-size: 1.5rem; color: var(--text-primary); margin: 0; font-weight: 600; }}
+            .login-brand p {{ color: var(--text-muted); margin: 0.5rem 0 0 0; font-size: 0.875rem; letter-spacing: 0.05em; }}
             .form-group {{ margin-bottom: 1.5rem; }}
-            label {{ display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--gray-700); }}
-            input {{ width: 100%; padding: 0.75rem; border: 1px solid var(--gray-200); border-radius: 0.375rem; font-size: 0.875rem; font-family: inherit; }}
-            input:focus {{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }}
-            .btn {{ width: 100%; padding: 0.75rem; background: var(--primary); color: white; border: none; border-radius: 0.375rem; font-size: 0.875rem; font-weight: 500; cursor: pointer; transition: background 0.2s; }}
-            .btn:hover {{ background: #1e40af; }}
-            .alert {{ background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; color: #ef4444; padding: 0.75rem; border-radius: 0.375rem; margin-bottom: 1.5rem; font-size: 0.875rem; }}
+            label {{ display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--text-primary); font-size: 0.875rem; }}
+            input {{ width: 100%; padding: 0.75rem 1rem; border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 0.5rem; font-size: 0.875rem; font-family: inherit; background: rgba(0, 0, 0, 0.3); color: var(--text-primary); transition: all 0.3s ease; }}
+            input:focus {{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.15), 0 0 20px rgba(0, 212, 255, 0.1); }}
+            input::placeholder {{ color: var(--text-muted); }}
+            .btn {{ width: 100%; padding: 0.75rem; background: linear-gradient(135deg, var(--primary), var(--accent-purple)); color: white; border: none; border-radius: 0.5rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; transition: all 0.3s ease; letter-spacing: 0.03em; }}
+            .btn:hover {{ box-shadow: 0 0 25px rgba(0, 212, 255, 0.3), 0 0 50px rgba(168, 85, 247, 0.15); transform: translateY(-1px); }}
+            .alert {{ background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; padding: 0.75rem; border-radius: 0.5rem; margin-bottom: 1.5rem; font-size: 0.875rem; }}
         </style>
     </head>
     <body>
@@ -1313,7 +1638,7 @@ def page_login(error=""):
             <div class="login-brand">
                 <i class="fas fa-fingerprint"></i>
                 <h1>Fingerprint Release</h1>
-                <p>Manager v2.0</p>
+                <p>Manager v3.0</p>
             </div>
             {error_html}
             <form method="POST" action="/login">
@@ -1328,7 +1653,7 @@ def page_login(error=""):
                 <button type="submit" class="btn">Sign In</button>
             </form>
             <p style="text-align:center;margin-top:1.25rem;font-size:.875rem;">
-                <a href="/forgot-password" style="color:var(--primary);text-decoration:none;">Forgot password?</a>
+                <a href="/forgot-password" style="color:var(--primary);text-decoration:none;transition:color 0.2s;">Forgot password?</a>
             </p>
         </div>
     </body>
@@ -1456,7 +1781,7 @@ def page_applicants(db, params, nav_user=None):
     </div>
     <div class="card">
         <table>
-            <thead><tr><th>Status</th><th>Order #</th><th>Name</th><th>Email</th><th>Code</th><th>Email Status</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Status</th><th>Order #</th><th>Name</th><th>DOB</th><th>Email</th><th>Code</th><th>Email Status</th><th>Actions</th></tr></thead>
             <tbody>
     """
 
@@ -1485,6 +1810,7 @@ def page_applicants(db, params, nav_user=None):
                     <td><span class="status-badge status-{safe_status}">{h(r['status'])}</span></td>
                     <td><code style="font-size:0.8rem;">{order_num}</code></td>
                     <td>{h(r['first_name'])} {h(r['last_name'])}</td>
+                    <td style="font-size:0.85rem;">{h(r.get('date_of_birth') or '-')}</td>
                     <td>
                         <form method="POST" action="/applicants/{r['id']}/update-email" style="display:flex; gap:4px; align-items:center;">
                             <input type="email" name="email" value="{h(r['email'] or '')}" placeholder="Enter email" style="width:180px; padding:4px 8px; font-size:0.85rem; border:1px solid #ccc; border-radius:4px;">
@@ -1522,6 +1848,10 @@ def page_add_applicant(nav_user=None):
             <div class="grid-2">
                 <div class="form-group"><label for="email">Email</label><input type="email" id="email" name="email"></div>
                 <div class="form-group"><label for="phone">Phone</label><input type="text" id="phone" name="phone"></div>
+            </div>
+            <div class="grid-2">
+                <div class="form-group"><label for="date_of_birth">Date of Birth</label><input type="date" id="date_of_birth" name="date_of_birth"></div>
+                <div class="form-group"><label for="last_four_ssn">Last 4 SSN</label><input type="text" id="last_four_ssn" name="last_four_ssn" maxlength="4" pattern="[0-9]{4}" placeholder="1234"></div>
             </div>
             <div class="form-group"><label for="accio_order_number">Accio Order Number</label><input type="text" id="accio_order_number" name="accio_order_number"></div>
             <div class="form-group"><label for="notes">Notes</label><textarea id="notes" name="notes" style="min-height: 100px;"></textarea></div>
@@ -1618,6 +1948,14 @@ def page_settings(db, nav_user=None):
     accio_username_val = h(get_setting(db, "accio_username"))
     accio_password_val = h(get_setting(db, "accio_password"))
     accio_researcher_url_val = h(get_setting(db, "accio_researcher_url"))
+    # SMS / Twilio settings
+    twilio_sid_val = h(get_setting(db, "twilio_account_sid"))
+    twilio_token_val = h(get_setting(db, "twilio_auth_token"))
+    twilio_from_val = h(get_setting(db, "twilio_from_number"))
+    auto_sms_checked = 'checked' if get_setting(db, "auto_send_sms") == "1" else ''
+    sms_body_val = h(get_setting(db, "sms_body"))
+    twilio_installed = "Installed" if HAS_TWILIO else "NOT INSTALLED - run: pip install twilio"
+    twilio_badge_color = "var(--success)" if HAS_TWILIO else "var(--danger, #e74c3c)"
 
     content = f"""
     <div class="card">
@@ -1673,6 +2011,48 @@ def page_settings(db, nav_user=None):
             <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Settings</button>
         </form>
     </div>
+    <div class="card">
+        <div class="card-title"><i class="fas fa-sms"></i> SMS Configuration (Twilio)</div>
+        <p style="color: var(--gray-500); font-size: 0.875rem; margin-bottom: 0.5rem;">
+            Send text messages to applicants alongside emails. SMS includes their IdentoGO code and scheduling instructions.
+        </p>
+        <p style="font-size: 0.8rem; margin-bottom: 1rem;">
+            Twilio SDK: <span style="color: {twilio_badge_color}; font-weight: bold;">{twilio_installed}</span>
+        </p>
+        <form method="POST" action="/settings">
+            <div class="grid-2">
+                <div class="form-group"><label for="twilio_account_sid">Twilio Account SID</label><input type="text" id="twilio_account_sid" name="twilio_account_sid" value="{twilio_sid_val}" placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
+                <div class="form-group"><label for="twilio_auth_token">Twilio Auth Token</label><input type="password" id="twilio_auth_token" name="twilio_auth_token" value="{twilio_token_val}"></div>
+            </div>
+            <div class="grid-2">
+                <div class="form-group"><label for="twilio_from_number">Twilio Phone Number (From)</label><input type="text" id="twilio_from_number" name="twilio_from_number" value="{twilio_from_val}" placeholder="+12255551234"></div>
+                <div class="form-group">
+                    <label>
+                        <input type="hidden" name="auto_send_sms" value="0">
+                        <input type="checkbox" name="auto_send_sms" value="1" {auto_sms_checked}>
+                        Auto-send SMS when code is assigned
+                    </label>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="sms_body">SMS Body Template</label>
+                <textarea id="sms_body" name="sms_body" style="min-height: 200px;">{sms_body_val}</textarea>
+                <p style="margin-top: 0.5rem; color: var(--gray-500); font-size: 0.875rem;">
+                    Available placeholders: {{first_name}}, {{last_name}}, {{code}}, {{company_name}}, {{ori_number}}<br>
+                    <strong>Tip:</strong> Keep SMS under 320 characters for best delivery (2 SMS segments max).
+                </p>
+            </div>
+            <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save SMS Settings</button>
+        </form>
+        <hr style="margin: 1rem 0;">
+        <form method="POST" action="/settings/test-sms" style="display: flex; gap: 0.5rem; align-items: end;">
+            <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                <label for="test_phone">Test SMS</label>
+                <input type="text" id="test_phone" name="test_phone" placeholder="+12255551234 or (225) 555-1234">
+            </div>
+            <button type="submit" class="btn" style="background: #25D366; color: white; white-space: nowrap;"><i class="fas fa-paper-plane"></i> Send Test SMS</button>
+        </form>
+    </div>
     """
     return render_page("Settings", content, active="settings", user=nav_user)
 
@@ -1680,6 +2060,7 @@ def page_settings(db, nav_user=None):
 def page_logs(db, nav_user=None):
     xml_rows = db.execute("SELECT * FROM xml_log ORDER BY id DESC LIMIT 50").fetchall()
     email_rows = db.execute("SELECT * FROM email_log ORDER BY id DESC LIMIT 50").fetchall()
+    sms_rows = db.execute("SELECT * FROM sms_log ORDER BY id DESC LIMIT 50").fetchall()
 
     xml_html = """<div class="card"><div class="card-title"><i class="fas fa-code"></i> XML Logs (Accio Push)</div>
     <table><thead><tr><th>ID</th><th>Direction</th><th>Status</th><th>Error</th><th>Received</th></tr></thead><tbody>"""
@@ -1693,7 +2074,13 @@ def page_logs(db, nav_user=None):
         email_html += f"<tr><td>{r['id']}</td><td>{h(r['recipient_email'] or '-')}</td><td>{h((r['subject'] or '')[:40])}</td><td>{h(r['status'] or '-')}</td><td>{h((r['error_message'] or '')[:40])}</td><td>{fmt_dt(r['sent_at'])}</td></tr>"
     email_html += "</tbody></table></div>"
 
-    return render_page("Logs", xml_html + email_html, active="logs", user=nav_user)
+    sms_html = """<div class="card"><div class="card-title"><i class="fas fa-sms"></i> SMS Logs</div>
+    <table><thead><tr><th>ID</th><th>Recipient</th><th>Twilio SID</th><th>Status</th><th>Error</th><th>Sent</th></tr></thead><tbody>"""
+    for r in sms_rows:
+        sms_html += f"<tr><td>{r['id']}</td><td>{h(r['recipient_phone'] or '-')}</td><td><code style='font-size:0.75rem;'>{h((r['twilio_sid'] or '-')[:20])}</code></td><td>{h(r['status'] or '-')}</td><td>{h((r['error_message'] or '')[:40])}</td><td>{fmt_dt(r['sent_at'])}</td></tr>"
+    sms_html += "</tbody></table></div>"
+
+    return render_page("Logs", xml_html + email_html + sms_html, active="logs", user=nav_user)
 
 
 def page_clients(db, params, nav_user=None):
@@ -1828,28 +2215,35 @@ This link is valid for <strong>2 hours</strong>.</p>
 
 
 def page_forgot_password(error="", success=""):
-    error_html = f'<div class="alert" style="background:rgba(239,68,68,0.1);border:1px solid #ef4444;color:#ef4444;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(error)}</div>' if error else ""
-    success_html = f'<div class="alert" style="background:rgba(16,185,129,0.1);border:1px solid #10b981;color:#10b981;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(success)}</div>' if success else ""
+    error_html = f'<div class="alert alert-error">{h(error)}</div>' if error else ""
+    success_html = f'<div class="alert alert-success">{h(success)}</div>' if success else ""
     return f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Forgot Password – Fingerprint Release Manager</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
-:root{{--primary:#2563eb;--gray-50:#f9fafb;--gray-200:#e5e7eb;--gray-400:#9ca3af;--gray-700:#374151;--gray-900:#111827;}}
+@keyframes glow-pulse{{0%,100%{{filter:drop-shadow(0 0 8px rgba(0,212,255,0.6));}}50%{{filter:drop-shadow(0 0 20px rgba(0,212,255,0.9));}}}}
+@keyframes float-in{{from{{opacity:0;transform:translateY(20px);}}to{{opacity:1;transform:translateY(0);}}}}
+:root{{--primary:#00d4ff;--accent-purple:#a855f7;--surface-0:#0a0e1a;--surface-1:rgba(15,23,42,0.85);--text-primary:#e2e8f0;--text-muted:#64748b;}}
 *{{margin:0;padding:0;box-sizing:border-box;}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,var(--primary) 0%,#1e40af 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
-.card{{background:white;border-radius:.5rem;box-shadow:0 10px 25px rgba(0,0,0,.2);padding:3rem;width:100%;max-width:400px;}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--surface-0);background-image:radial-gradient(ellipse at 20% 50%,rgba(0,212,255,0.08) 0%,transparent 50%),radial-gradient(ellipse at 80% 50%,rgba(168,85,247,0.06) 0%,transparent 50%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
+.card{{background:var(--surface-1);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border:1px solid rgba(0,212,255,0.15);border-radius:1rem;box-shadow:0 10px 40px rgba(0,0,0,0.5),0 0 60px rgba(0,212,255,0.05);padding:3rem;width:100%;max-width:420px;animation:float-in 0.6s ease-out;}}
 .brand{{text-align:center;margin-bottom:2rem;}}
-.brand i{{font-size:3rem;color:var(--primary);margin-bottom:.5rem;}}
-.brand h1{{font-size:1.5rem;color:var(--gray-900);margin:0;}}
-.brand p{{color:var(--gray-400);margin:.5rem 0 0;font-size:.875rem;}}
+.brand i{{font-size:3rem;background:linear-gradient(135deg,var(--primary),var(--accent-purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:.5rem;animation:glow-pulse 3s ease-in-out infinite;}}
+.brand h1{{font-size:1.5rem;color:var(--text-primary);margin:0;font-weight:600;}}
+.brand p{{color:var(--text-muted);margin:.5rem 0 0;font-size:.875rem;letter-spacing:0.05em;}}
 .fg{{margin-bottom:1.5rem;}}
-label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--gray-700);}}
-input{{width:100%;padding:.75rem;border:1px solid var(--gray-200);border-radius:.375rem;font-size:.875rem;font-family:inherit;}}
-input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1);}}
-.btn{{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.375rem;font-size:.875rem;font-weight:500;cursor:pointer;transition:background .2s;}}
-.btn:hover{{background:#1e40af;}}
-.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;}}
+label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--text-primary);font-size:.875rem;}}
+input{{width:100%;padding:.75rem 1rem;border:1px solid rgba(0,212,255,0.2);border-radius:.5rem;font-size:.875rem;font-family:inherit;background:rgba(0,0,0,0.3);color:var(--text-primary);transition:all 0.3s ease;}}
+input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(0,212,255,0.15),0 0 20px rgba(0,212,255,0.1);}}
+input::placeholder{{color:var(--text-muted);}}
+.btn{{width:100%;padding:.75rem;background:linear-gradient(135deg,var(--primary),var(--accent-purple));color:white;border:none;border-radius:.5rem;font-size:.875rem;font-weight:600;cursor:pointer;transition:all 0.3s ease;letter-spacing:0.03em;}}
+.btn:hover{{box-shadow:0 0 25px rgba(0,212,255,0.3),0 0 50px rgba(168,85,247,0.15);transform:translateY(-1px);}}
+.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;transition:color 0.2s;}}
+.back:hover{{color:#a855f7;}}
+.alert{{padding:.75rem;border-radius:.5rem;margin-bottom:1.5rem;font-size:.875rem;}}
+.alert-error{{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);color:#f87171;}}
+.alert-success{{background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.4);color:#34d399;}}
 </style></head><body>
 <div class="card">
   <div class="brand"><i class="fas fa-fingerprint"></i><h1>Forgot Password</h1><p>Enter your username or recovery email</p></div>
@@ -1860,27 +2254,31 @@ input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(
 
 
 def page_reset_password(token, error=""):
-    error_html = f'<div class="alert" style="background:rgba(239,68,68,0.1);border:1px solid #ef4444;color:#ef4444;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(error)}</div>' if error else ""
+    error_html = f'<div class="alert" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:.75rem;border-radius:.5rem;margin-bottom:1.5rem;font-size:.875rem;">{h(error)}</div>' if error else ""
     return f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Reset Password – Fingerprint Release Manager</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
-:root{{--primary:#2563eb;--gray-50:#f9fafb;--gray-200:#e5e7eb;--gray-400:#9ca3af;--gray-700:#374151;--gray-900:#111827;}}
+@keyframes glow-pulse{{0%,100%{{filter:drop-shadow(0 0 8px rgba(0,212,255,0.6));}}50%{{filter:drop-shadow(0 0 20px rgba(0,212,255,0.9));}}}}
+@keyframes float-in{{from{{opacity:0;transform:translateY(20px);}}to{{opacity:1;transform:translateY(0);}}}}
+:root{{--primary:#00d4ff;--accent-purple:#a855f7;--surface-0:#0a0e1a;--surface-1:rgba(15,23,42,0.85);--text-primary:#e2e8f0;--text-muted:#64748b;}}
 *{{margin:0;padding:0;box-sizing:border-box;}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,var(--primary) 0%,#1e40af 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
-.card{{background:white;border-radius:.5rem;box-shadow:0 10px 25px rgba(0,0,0,.2);padding:3rem;width:100%;max-width:400px;}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--surface-0);background-image:radial-gradient(ellipse at 20% 50%,rgba(0,212,255,0.08) 0%,transparent 50%),radial-gradient(ellipse at 80% 50%,rgba(168,85,247,0.06) 0%,transparent 50%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
+.card{{background:var(--surface-1);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border:1px solid rgba(0,212,255,0.15);border-radius:1rem;box-shadow:0 10px 40px rgba(0,0,0,0.5),0 0 60px rgba(0,212,255,0.05);padding:3rem;width:100%;max-width:420px;animation:float-in 0.6s ease-out;}}
 .brand{{text-align:center;margin-bottom:2rem;}}
-.brand i{{font-size:3rem;color:var(--primary);margin-bottom:.5rem;}}
-.brand h1{{font-size:1.5rem;color:var(--gray-900);margin:0;}}
+.brand i{{font-size:3rem;background:linear-gradient(135deg,var(--primary),var(--accent-purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:.5rem;animation:glow-pulse 3s ease-in-out infinite;}}
+.brand h1{{font-size:1.5rem;color:var(--text-primary);margin:0;font-weight:600;}}
 .fg{{margin-bottom:1.5rem;}}
-label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--gray-700);}}
-input{{width:100%;padding:.75rem;border:1px solid var(--gray-200);border-radius:.375rem;font-size:.875rem;font-family:inherit;}}
-input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1);}}
-.btn{{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.375rem;font-size:.875rem;font-weight:500;cursor:pointer;}}
-.btn:hover{{background:#1e40af;}}
-.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;}}
-.hint{{color:#6b7280;font-size:.8rem;margin-top:.25rem;}}
+label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--text-primary);font-size:.875rem;}}
+input{{width:100%;padding:.75rem 1rem;border:1px solid rgba(0,212,255,0.2);border-radius:.5rem;font-size:.875rem;font-family:inherit;background:rgba(0,0,0,0.3);color:var(--text-primary);transition:all 0.3s ease;}}
+input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(0,212,255,0.15),0 0 20px rgba(0,212,255,0.1);}}
+input::placeholder{{color:var(--text-muted);}}
+.btn{{width:100%;padding:.75rem;background:linear-gradient(135deg,var(--primary),var(--accent-purple));color:white;border:none;border-radius:.5rem;font-size:.875rem;font-weight:600;cursor:pointer;transition:all 0.3s ease;letter-spacing:0.03em;}}
+.btn:hover{{box-shadow:0 0 25px rgba(0,212,255,0.3),0 0 50px rgba(168,85,247,0.15);transform:translateY(-1px);}}
+.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;transition:color 0.2s;}}
+.back:hover{{color:#a855f7;}}
+.hint{{color:var(--text-muted);font-size:.8rem;margin-top:.25rem;}}
 </style></head><body>
 <div class="card">
   <div class="brand"><i class="fas fa-key"></i><h1>Set New Password</h1></div>
@@ -2458,6 +2856,7 @@ class Handler(BaseHTTPRequestHandler):
                     added = 0
                     auto_assign = get_setting(db, "auto_assign_codes") == "1"
                     auto_email = get_setting(db, "auto_send_email") == "1"
+                    auto_sms = get_setting(db, "auto_send_sms") == "1"
 
                     for a in applicants_data:
                         try:
@@ -2481,11 +2880,12 @@ class Handler(BaseHTTPRequestHandler):
                                         client_id = client["id"]
 
                                 cur = db.execute(
-                                    "INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number,client_id,accio_sub_order,accio_order_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                                    "INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number,client_id,accio_sub_order,accio_order_type,date_of_birth,last_four_ssn) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                                     (a["first_name"], a["last_name"], a.get("email", ""),
                                      a.get("phone", ""), a.get("accio_order_number", ""),
                                      a.get("accio_remote_number", ""), client_id,
-                                     a.get("accio_sub_order", "1"), a.get("accio_order_type", "Fingerprint"))
+                                     a.get("accio_sub_order", "1"), a.get("accio_order_type", "Fingerprint"),
+                                     a.get("date_of_birth", ""), a.get("last_four_ssn", ""))
                                 )
                                 new_id = cur.fetchone()["id"]
                                 added += 1
@@ -2509,6 +2909,12 @@ class Handler(BaseHTTPRequestHandler):
                                                 send_release_email(db, new_id)
                                             except Exception as email_err:
                                                 logging.error(f"Auto-email failed for applicant {new_id}: {email_err}")
+                                        # Auto-SMS if applicant has a valid phone number
+                                        if auto_sms and a.get("phone", "").strip():
+                                            try:
+                                                send_release_sms(db, new_id)
+                                            except Exception as sms_err:
+                                                logging.error(f"Auto-SMS failed for applicant {new_id}: {sms_err}")
                         except Exception as proc_err:
                             logging.error(f"Error processing applicant: {proc_err}")
 
@@ -2613,9 +3019,9 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/applicants/add":
                 db.execute(
-                    "INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,notes) VALUES (%s,%s,%s,%s,%s,%s)",
+                    "INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,notes,date_of_birth,last_four_ssn) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                     (fv("first_name"), fv("last_name"), fv("email"), fv("phone"),
-                     fv("accio_order_number"), fv("notes"))
+                     fv("accio_order_number"), fv("notes"), fv("date_of_birth"), fv("last_four_ssn"))
                 )
                 flash("Applicant added.", "success")
                 self._redirect("/applicants")
@@ -2630,7 +3036,16 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/applicants/") and path.endswith("/send-email"):
                 aid = int(path.split("/")[2])
                 ok, msg = send_release_email(db, aid)
-                flash(msg, "success" if ok else "error")
+                # Also send SMS if auto_send_sms is on and applicant has phone
+                sms_msg = ""
+                a_row = db.execute("SELECT phone FROM applicants WHERE id = %s", (aid,)).fetchone()
+                if get_setting(db, "auto_send_sms") == "1" and a_row and a_row.get("phone", "").strip():
+                    try:
+                        sms_ok, sms_msg = send_release_sms(db, aid)
+                        sms_msg = " SMS also sent!" if sms_ok else f" SMS failed: {sms_msg}"
+                    except Exception as sms_err:
+                        sms_msg = f" SMS error: {sms_err}"
+                flash(msg + sms_msg, "success" if ok else "error")
                 self._redirect("/applicants")
 
             elif path.startswith("/applicants/") and path.endswith("/assign-and-send"):
@@ -2639,8 +3054,23 @@ class Handler(BaseHTTPRequestHandler):
                 if a and not a["assigned_code"]:
                     assign_code(db, aid)
                 ok, msg = send_release_email(db, aid)
-                flash("Code assigned & email sent!" if ok else f"Code assigned but email failed: {msg}",
+                # Also send SMS
+                sms_note = ""
+                a_refresh = db.execute("SELECT phone FROM applicants WHERE id = %s", (aid,)).fetchone()
+                if get_setting(db, "auto_send_sms") == "1" and a_refresh and a_refresh.get("phone", "").strip():
+                    try:
+                        sms_ok, sms_detail = send_release_sms(db, aid)
+                        sms_note = " + SMS sent!" if sms_ok else f" (SMS failed: {sms_detail})"
+                    except Exception as sms_err:
+                        sms_note = f" (SMS error: {sms_err})"
+                flash(("Code assigned & email sent!" + sms_note) if ok else f"Code assigned but email failed: {msg}",
                       "success" if ok else "error")
+                self._redirect("/applicants")
+
+            elif path.startswith("/applicants/") and path.endswith("/send-sms"):
+                aid = int(path.split("/")[2])
+                ok, msg = send_release_sms(db, aid)
+                flash(msg, "success" if ok else "error")
                 self._redirect("/applicants")
 
             elif path.startswith("/applicants/") and path.endswith("/update-email"):
@@ -2668,7 +3098,15 @@ class Handler(BaseHTTPRequestHandler):
                     flash("No code assigned yet. Use 'Assign & Send' first.", "error")
                 else:
                     ok, msg = send_release_email(db, aid)
-                    flash(f"Email resent to {a['email']}!" if ok else f"Resend failed: {msg}",
+                    # Also resend SMS if phone is available
+                    sms_note = ""
+                    if get_setting(db, "auto_send_sms") == "1" and a.get("phone", "").strip():
+                        try:
+                            sms_ok, sms_detail = send_release_sms(db, aid)
+                            sms_note = f" SMS also resent to {a['phone']}!" if sms_ok else f" (SMS resend failed: {sms_detail})"
+                        except Exception as sms_err:
+                            sms_note = f" (SMS error: {sms_err})"
+                    flash((f"Email resent to {a['email']}!" + sms_note) if ok else f"Resend failed: {msg}",
                           "success" if ok else "error")
                 self._redirect("/applicants")
 
@@ -2686,6 +3124,7 @@ class Handler(BaseHTTPRequestHandler):
                                (applicant["assigned_code"],))
                 db.execute("DELETE FROM email_tracking WHERE applicant_id = %s", (aid,))
                 db.execute("DELETE FROM email_log WHERE applicant_id = %s", (aid,))
+                db.execute("DELETE FROM sms_log WHERE applicant_id = %s", (aid,))
                 db.execute("DELETE FROM applicants WHERE id = %s", (aid,))
                 flash("Applicant deleted.", "success")
                 self._redirect("/applicants")
@@ -2694,9 +3133,10 @@ class Handler(BaseHTTPRequestHandler):
                 pending = db.execute(
                     "SELECT * FROM applicants WHERE status='pending' AND email IS NOT NULL AND email != ''"
                 ).fetchall()
-                succ, fail = 0, 0
+                succ, fail, sms_succ, sms_fail = 0, 0, 0, 0
+                bulk_auto_sms = get_setting(db, "auto_send_sms") == "1"
                 for i, a in enumerate(pending):
-                    # Throttle: 2-second delay between emails to avoid being
+                    # Throttle: 2-second delay between messages to avoid being
                     # flagged as a spam bot by receiving mail servers.
                     if i > 0:
                         time.sleep(2)
@@ -2707,10 +3147,21 @@ class Handler(BaseHTTPRequestHandler):
                             succ += 1
                         else:
                             fail += 1
+                        # Also send SMS if phone available
+                        if bulk_auto_sms and a.get("phone", "").strip():
+                            try:
+                                s_ok, _ = send_release_sms(db, a["id"])
+                                if s_ok:
+                                    sms_succ += 1
+                                else:
+                                    sms_fail += 1
+                            except Exception:
+                                sms_fail += 1
                     else:
                         fail += 1
                         break  # Stop if we run out of codes
-                flash(f"Done: {succ} sent, {fail} failed.", "success")
+                sms_note = f" | SMS: {sms_succ} sent, {sms_fail} failed" if (sms_succ + sms_fail) > 0 else ""
+                flash(f"Done: {succ} emailed, {fail} failed{sms_note}.", "success")
                 self._redirect("/applicants")
 
             elif path.startswith("/codes/") and path.endswith("/delete"):
@@ -2815,6 +3266,37 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as e:
                         logger.error(f"Test email FAILED: {type(e).__name__}: {e}")
                         flash(f"Test failed: {type(e).__name__}: {e}", "error")
+                self._redirect("/settings")
+
+            elif path == "/settings/test-sms":
+                phone = fv("test_phone").strip()
+                if not phone:
+                    flash("Enter a phone number to test.", "error")
+                elif not HAS_TWILIO:
+                    flash("Twilio library not installed. Run: pip install twilio", "error")
+                else:
+                    normalized = normalize_phone(phone)
+                    if not normalized:
+                        flash(f"Invalid phone number: {phone}. Use 10-digit US format.", "error")
+                    else:
+                        try:
+                            sid = get_setting(db, "twilio_account_sid").strip()
+                            tok = get_setting(db, "twilio_auth_token").strip()
+                            frm = get_setting(db, "twilio_from_number").strip()
+                            if not sid or not tok or not frm:
+                                flash("Configure Twilio SID, Auth Token, and From Number first.", "error")
+                            else:
+                                client = TwilioClient(sid, tok)
+                                msg = client.messages.create(
+                                    body="Test SMS from Fingerprint Release Manager. Twilio is working!",
+                                    from_=frm,
+                                    to=normalized
+                                )
+                                logger.info(f"Test SMS sent to {normalized}, SID={msg.sid}")
+                                flash(f"Test SMS sent to {normalized}! (SID: {msg.sid})", "success")
+                        except Exception as e:
+                            logger.error(f"Test SMS FAILED: {type(e).__name__}: {e}")
+                            flash(f"Test SMS failed: {type(e).__name__}: {e}", "error")
                 self._redirect("/settings")
 
             # ------------------------------------------------------------------
