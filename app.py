@@ -1,31 +1,21 @@
 """
-Fingerprint Release Manager - v3.0 (SMS + Email)
-Integrates with Accio Data XML API to automate fingerprint release form distribution.
+Fingerprint Release Manager - v4.0 (SMS + Email + LAPS Retriever)
+Integrates with Accio Data XML API to automate fingerprint release form distribution
+and criminal history retrieval from Louisiana LAPS portal.
 
-New Features in v3.0:
-- SMS notifications via Twilio (texts applicants alongside email)
-- Dual-channel delivery: email + SMS sent automatically on code assignment
-- SMS logging and tracking (sms_log table)
-- Twilio configuration in Settings UI with test SMS
-- Phone number normalization for reliable SMS delivery
+New in v4.0:
+- LAPS Retriever: Automated criminal history retrieval from Louisiana LAPS portal
+- Hourly background worker scans LAPS "Recently Completed" tab
+- Matches LAPS results to FP Release applicants (name + SSN last 4)
+- Pushes criminal history results back to Accio via PostResults XML API
+- LAPS Dashboard section with real-time status and cycle history
+- Secure in-memory-only handling of criminal records (zero disk writes)
 
-Existing Features:
-- Multi-user login system with session management
-- Client tracking from Accio XML
-- Dashboard with analytics
-- Email open tracking with pixels
-- Applicant status workflow
-- Clients management page
+Two-Step Workflow:
+  STEP 1 (FP Release -> Applicant): XML push -> code assignment -> email/SMS to applicant
+  STEP 2 (LAPS -> FP Release -> Accio): LAPS scrape -> parse rap sheet -> match applicant -> PostResults
 
-Workflow:
-1. Receives applicant data via XML push from Accio Data (or manual entry)
-2. Manages a pool of IdentoGO one-time payment codes (imported from Excel)
-3. Assigns a code to each applicant
-4. Emails the applicant their fingerprint release form PDF with their assigned code
-5. Sends SMS to applicant with code, instructions, and scheduling info
-6. Tracks email opens, SMS delivery, and applicant status
-
-Built with Python standard library + openpyxl for Excel support + twilio for SMS.
+Built with Python standard library + openpyxl + twilio + playwright + httpx.
 """
 
 import os
@@ -60,6 +50,30 @@ from xml.etree import ElementTree as ET
 from string import Template
 import time
 import re
+import asyncio
+import ctypes
+import gc
+import signal as signal_module
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field as dc_field
+from enum import Enum
+from typing import Any, Optional, Dict, List, Tuple
+
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+    print("WARNING: httpx not installed. LAPS Retriever requires it. Run: pip install httpx")
+
+try:
+    from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    print("WARNING: playwright not installed. LAPS Retriever requires it.")
+    print("Run: pip install playwright && playwright install chromium")
 
 try:
     import psycopg2
@@ -106,6 +120,42 @@ os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# LAPS Retriever Configuration (all secrets from environment variables)
+# ---------------------------------------------------------------------------
+LAPS_USERNAME = os.environ.get("LAPS_USERNAME", "")
+LAPS_PASSWORD = os.environ.get("LAPS_PASSWORD", "")
+LAPS_PORTAL_URL = "https://la.flexcheck.us.idemia.io/LAPSPortal/"
+
+# FlexCheck Token Grid (printed security token sheet dated 02/10/2026)
+LAPS_TOKEN_GRID = {
+    "1": {"A": "rLa#EU", "B": "PBmCVx", "C": "LYZEp2", "D": "7@ct5J", "E": "pMR6lHn", "F": "WxwAJ@", "G": "mayzBB", "H": "Jz3a@S", "I": "BK4q6F", "J": "ksBY@R"},
+    "2": {"A": "FB2VNf", "B": "Rm@hvf", "C": "ZfxM&x", "D": "fZ3xSB", "E": "WDxs9i", "F": "2w6zGr", "G": "WEz*HD", "H": "RqXyC6", "I": "zx@maW", "J": "B@mswU"},
+    "3": {"A": "2b#hiL", "B": "zd66Bc", "C": "uvFvTx", "D": "9jQLje", "E": "rWKLCG", "F": "VHjWye", "G": "mtF*ov", "H": "q9Xr3*", "I": "6PkGDW", "J": "jcYm2N"},
+    "4": {"A": "pDj@m2", "B": "i3kTx2", "C": "cfVRmp", "D": "wCK6@7", "E": "ztgpF#", "F": "ussRLe", "G": "z@EBnP", "H": "qX97p3", "I": "#o5Qi*", "J": "ej6E6U"},
+    "5": {"A": "txMoyJ", "B": "Sga2EN", "C": "7tNtuT", "D": "YeCwu4", "E": "Xe6pCo", "F": "&q6c&m", "G": "ZyMYLa", "H": "iKCpvS", "I": "y5vZCr", "J": "HMbrt*"},
+}
+
+# Accio PostResults config for LAPS results
+ACCIO_API_BASE_URL = os.environ.get("ACCIO_API_BASE_URL", "")
+ACCIO_API_ACCOUNT = os.environ.get("ACCIO_API_ACCOUNT", "")
+ACCIO_API_USERNAME_LAPS = os.environ.get("ACCIO_API_USERNAME", "")
+ACCIO_API_PASSWORD_LAPS = os.environ.get("ACCIO_API_PASSWORD", "")
+ACCIO_API_MODE = os.environ.get("ACCIO_API_MODE", "PROD")
+ACCIO_REGISTRATION_KEY = os.environ.get("ACCIO_REGISTRATION_KEY", "")
+ACCIO_REGISTRATION_COMPANY = os.environ.get("ACCIO_REGISTRATION_COMPANY", "Background Research Solutions, LLC")
+ACCIO_POSTRESULTS_PATH = os.environ.get("ACCIO_POSTRESULTS_PATH", "/c/p/researcherxml")
+
+# LAPS operational tuning
+LAPS_HTTP_TIMEOUT = int(os.environ.get("LAPS_HTTP_TIMEOUT", "30"))
+LAPS_PLAYWRIGHT_TIMEOUT = int(os.environ.get("LAPS_PLAYWRIGHT_TIMEOUT", "30000"))
+LAPS_MAX_RETRIES = int(os.environ.get("LAPS_MAX_RETRIES", "3"))
+LAPS_RETRY_BASE_DELAY = float(os.environ.get("LAPS_RETRY_BASE_DELAY", "2.0"))
+LAPS_HOURLY_INTERVAL = int(os.environ.get("LAPS_HOURLY_INTERVAL", "3600"))
+
+# LAPS feature toggle
+LAPS_ENABLED = os.environ.get("LAPS_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # ---------------------------------------------------------------------------
 # Database
@@ -275,6 +325,36 @@ def init_db():
         )
     """)
 
+    # LAPS retrieval tracking tables
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS laps_cycle_log (
+            id SERIAL PRIMARY KEY,
+            started_at TIMESTAMP DEFAULT NOW(),
+            finished_at TIMESTAMP,
+            processed INTEGER DEFAULT 0,
+            matched INTEGER DEFAULT 0,
+            pushed INTEGER DEFAULT 0,
+            skipped INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0,
+            errors TEXT,
+            status TEXT DEFAULT 'running'
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS laps_result_log (
+            id SERIAL PRIMARY KEY,
+            applicant_id INTEGER REFERENCES applicants(id),
+            cycle_id INTEGER REFERENCES laps_cycle_log(id),
+            laps_name TEXT,
+            laps_status TEXT,
+            record_count INTEGER DEFAULT 0,
+            accio_push_ok BOOLEAN DEFAULT FALSE,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
     # Add new columns to existing tables if they don't exist
     try:
         db.execute("ALTER TABLE users ADD COLUMN recovery_email TEXT")
@@ -309,6 +389,16 @@ def init_db():
     for col_sql in [
         "ALTER TABLE applicants ADD COLUMN sms_sent BOOLEAN DEFAULT FALSE",
         "ALTER TABLE applicants ADD COLUMN sms_sent_at TIMESTAMP",
+    ]:
+        try:
+            db.execute(col_sql)
+        except psycopg2.Error:
+            pass  # Column already exists
+
+    # LAPS integration columns
+    for col_sql in [
+        "ALTER TABLE applicants ADD COLUMN laps_status VARCHAR(50) DEFAULT NULL",
+        "ALTER TABLE applicants ADD COLUMN laps_retrieved_at TIMESTAMP DEFAULT NULL",
     ]:
         try:
             db.execute(col_sql)
@@ -1395,6 +1485,1242 @@ def fmt_dt(val):
     return val.strftime("%Y-%m-%d %H:%M")
 
 
+# ===========================================================================
+# LAPS RETRIEVER ENGINE (Step 2 of FP Release workflow)
+# ===========================================================================
+# Security: Criminal records exist ONLY in RAM during processing (never disk)
+# Triple-layer ephemeral handling: in-memory -> immediate zeroing -> forced GC
+# Zero disk writes for PII, zero logging of personal information
+
+laps_logger = logging.getLogger("laps_retriever")
+
+# --- Secure Memory Handling ---
+
+def _secure_zero_string(s):
+    """Best-effort secure zeroing of a Python string's internal buffer."""
+    if not s:
+        return ""
+    try:
+        buf_size = len(s)
+        str_address = id(s)
+        probe_byte = s[0].encode("utf-8")[0] if s else 0
+        for candidate_offset in (40, 48, 52, 56):
+            try:
+                test_val = ctypes.c_char.from_address(str_address + candidate_offset).value
+                if test_val == bytes([probe_byte]):
+                    ctypes.memset(str_address + candidate_offset, 0, buf_size)
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "\x00" * len(s)
+
+
+class SecurePassword:
+    """Triple-layered ephemeral password container. Value in RAM only, zeroed on destroy."""
+    __slots__ = ("_value", "_destroyed")
+
+    def __init__(self, raw):
+        self._value = "".join(list(raw))
+        self._destroyed = False
+
+    def get(self):
+        if self._destroyed:
+            raise RuntimeError("Password has been destroyed")
+        return self._value
+
+    def destroy(self):
+        if self._destroyed:
+            return
+        old_val = self._value
+        self._value = _secure_zero_string(old_val)
+        self._value = "\x00" * max(len(old_val), 32)
+        del old_val
+        del self._value
+        self._destroyed = True
+        gc.collect()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.destroy()
+
+    def __del__(self):
+        if getattr(self, "_destroyed", True) is False:
+            self.destroy()
+
+
+# --- LAPS Data Models ---
+
+class CriminalHistoryStatus(str, Enum):
+    CLEAR = "Clear"
+    HITS = "Hits"
+    ERROR = "Error"
+
+
+@dataclass(frozen=True)
+class CriminalRecord:
+    """Single arrest/criminal record from LAPS rap sheet."""
+    arrest_date: str
+    agency: str
+    charges: list
+    disposition: str = ""
+
+
+@dataclass(frozen=True)
+class RapSheet:
+    """Parsed LAPS rap sheet."""
+    subject_name: str
+    subject_ssn_last4: str
+    subject_dob: str
+    records: list
+    status: CriminalHistoryStatus
+    extracted_at: str
+
+
+@dataclass
+class LAPSApplicantMatch:
+    """Applicant from FP Release DB matching a LAPS rap sheet."""
+    id: int
+    first_name: str
+    last_name: str
+    last_four_ssn: str
+    accio_order_number: str
+    accio_sub_order: str
+    email_sent_at: object
+    created_at: object
+
+
+# --- LAPS Name Parser ---
+
+def _parse_laps_name(full_name):
+    """Parse LAPS 'LAST, FIRST MIDDLE' format into (first_name, last_name)."""
+    full_name = full_name.strip()
+    if "," in full_name:
+        parts = full_name.split(",", 1)
+        last_name = parts[0].strip()
+        first_and_middle = parts[1].strip()
+        first_name = first_and_middle.split()[0] if first_and_middle else ""
+        return (first_name, last_name)
+    else:
+        parts = full_name.split()
+        if len(parts) >= 2:
+            return (parts[0], parts[-1])
+        return (full_name, "")
+
+
+# --- LAPS Database Operations ---
+
+class LAPSDB:
+    """Database operations for LAPS retriever using the shared FP Release DB."""
+
+    def get_pending_applicants(self, limit=50):
+        """Fetch applicants needing LAPS lookup: email_sent=True, laps_status IS NULL."""
+        db = get_db()
+        try:
+            cur = db.execute("""
+                SELECT id, first_name, last_name, last_four_ssn,
+                       accio_order_number, accio_sub_order,
+                       email_sent_at, created_at
+                FROM applicants
+                WHERE email_sent = TRUE AND laps_status IS NULL
+                ORDER BY email_sent_at DESC, created_at DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+            return [
+                LAPSApplicantMatch(
+                    id=r["id"], first_name=r["first_name"], last_name=r["last_name"],
+                    last_four_ssn=r.get("last_four_ssn") or "",
+                    accio_order_number=r.get("accio_order_number") or "",
+                    accio_sub_order=r.get("accio_sub_order") or "",
+                    email_sent_at=r.get("email_sent_at"),
+                    created_at=r["created_at"],
+                )
+                for r in rows
+            ]
+        except Exception as e:
+            laps_logger.error("Failed to fetch pending applicants: %s", e)
+            return []
+        finally:
+            db.close()
+
+    def find_matching_applicant(self, last_name, first_name, last_four_ssn):
+        """Match a LAPS rap sheet subject to an FP Release applicant."""
+        if not last_name or not first_name:
+            return None
+        db = get_db()
+        try:
+            if last_four_ssn:
+                cur = db.execute("""
+                    SELECT id, first_name, last_name, last_four_ssn,
+                           accio_order_number, accio_sub_order, email_sent_at, created_at
+                    FROM applicants
+                    WHERE LOWER(TRIM(last_name)) = LOWER(TRIM(%s))
+                      AND LOWER(TRIM(first_name)) = LOWER(TRIM(%s))
+                      AND last_four_ssn = %s
+                      AND email_sent = TRUE AND laps_status IS NULL
+                    ORDER BY email_sent_at DESC NULLS LAST, created_at DESC
+                    LIMIT 1
+                """, (last_name, first_name, last_four_ssn))
+            else:
+                cur = db.execute("""
+                    SELECT id, first_name, last_name, last_four_ssn,
+                           accio_order_number, accio_sub_order, email_sent_at, created_at
+                    FROM applicants
+                    WHERE LOWER(TRIM(last_name)) = LOWER(TRIM(%s))
+                      AND LOWER(TRIM(first_name)) = LOWER(TRIM(%s))
+                      AND email_sent = TRUE AND laps_status IS NULL
+                    ORDER BY email_sent_at DESC NULLS LAST, created_at DESC
+                    LIMIT 1
+                """, (last_name, first_name))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return LAPSApplicantMatch(
+                id=row["id"], first_name=row["first_name"], last_name=row["last_name"],
+                last_four_ssn=row.get("last_four_ssn") or "",
+                accio_order_number=row.get("accio_order_number") or "",
+                accio_sub_order=row.get("accio_sub_order") or "",
+                email_sent_at=row.get("email_sent_at"),
+                created_at=row["created_at"],
+            )
+        except Exception as e:
+            laps_logger.error("Failed to find matching applicant: %s", e)
+            return None
+        finally:
+            db.close()
+
+    def update_applicant_laps_status(self, applicant_id, laps_status):
+        """Update applicant's LAPS retrieval status."""
+        db = get_db()
+        try:
+            db.execute("""
+                UPDATE applicants
+                SET laps_status = %s, laps_retrieved_at = NOW(), updated_at = NOW()
+                WHERE id = %s
+            """, (laps_status, applicant_id))
+            return True
+        except Exception as e:
+            laps_logger.error("Failed to update applicant %d: %s", applicant_id, e)
+            return False
+        finally:
+            db.close()
+
+    def log_cycle_start(self):
+        """Log start of a LAPS retrieval cycle. Returns cycle_id."""
+        db = get_db()
+        try:
+            cur = db.execute("""
+                INSERT INTO laps_cycle_log (started_at, status) VALUES (NOW(), 'running')
+                RETURNING id
+            """)
+            row = cur.fetchone()
+            return row["id"] if row else None
+        except Exception as e:
+            laps_logger.error("Failed to log cycle start: %s", e)
+            return None
+        finally:
+            db.close()
+
+    def log_cycle_end(self, cycle_id, summary):
+        """Log end of a LAPS retrieval cycle."""
+        db = get_db()
+        try:
+            errors_text = "; ".join(summary.get("errors", []))[:2000]
+            db.execute("""
+                UPDATE laps_cycle_log
+                SET finished_at = NOW(), processed = %s, matched = %s,
+                    pushed = %s, skipped = %s, failed = %s,
+                    errors = %s, status = %s
+                WHERE id = %s
+            """, (
+                summary.get("processed", 0), summary.get("matched", 0),
+                summary.get("pushed", 0), summary.get("skipped", 0),
+                summary.get("failed", 0), errors_text or None,
+                "completed" if not summary.get("errors") else "completed_with_errors",
+                cycle_id,
+            ))
+        except Exception as e:
+            laps_logger.error("Failed to log cycle end: %s", e)
+        finally:
+            db.close()
+
+    def log_result(self, applicant_id, cycle_id, laps_name, laps_status, record_count, push_ok, notes=""):
+        """Log individual LAPS result."""
+        db = get_db()
+        try:
+            db.execute("""
+                INSERT INTO laps_result_log
+                    (applicant_id, cycle_id, laps_name, laps_status, record_count, accio_push_ok, notes)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (applicant_id, cycle_id, laps_name, laps_status, record_count, push_ok, notes or None))
+        except Exception as e:
+            laps_logger.error("Failed to log LAPS result: %s", e)
+        finally:
+            db.close()
+
+
+# --- Rap Sheet Parser ---
+
+class RapSheetParser:
+    """Parses fixed-width mainframe-style rap sheet text from LAPS."""
+
+    def __init__(self, raw_text):
+        self.raw_text = raw_text
+        self.lines = raw_text.split("\n")
+
+    def parse(self):
+        subject_name = self._extract_subject_name()
+        subject_ssn_last4 = self._extract_subject_ssn_last4()
+        subject_dob = self._extract_subject_dob()
+        records = self._extract_arrest_records()
+        status = CriminalHistoryStatus.HITS if records else CriminalHistoryStatus.CLEAR
+        return RapSheet(
+            subject_name=subject_name, subject_ssn_last4=subject_ssn_last4,
+            subject_dob=subject_dob, records=records, status=status,
+            extracted_at=datetime.now(ZoneInfo("UTC")).isoformat(),
+        )
+
+    def _extract_subject_name(self):
+        for line in self.lines:
+            match = re.match(r"\s*NAME\s*:\s*(.+?)(?:\s+(?:DOB|BIRTH|SEX|RACE)\s*:|$)", line, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                if name:
+                    return name
+        return ""
+
+    def _extract_subject_ssn_last4(self):
+        for line in self.lines:
+            if re.search(r"SSN\s*:", line, re.IGNORECASE):
+                match = re.search(r"(\d{3})-?(\d{2})-?(\d{4})", line)
+                if match:
+                    return match.group(3)
+                match = re.search(r"[*xX]{3}-?[*xX]{2}-?(\d{4})", line)
+                if match:
+                    return match.group(1)
+        return ""
+
+    def _extract_subject_dob(self):
+        for line in self.lines:
+            match = re.search(
+                r"(?:DOB|BIRTH\s*DATE|DATE\s*OF\s*BIRTH)\s*:\s*(\d{2}/\d{2}/\d{4})",
+                line, re.IGNORECASE,
+            )
+            if match:
+                return match.group(1)
+            match = re.search(
+                r"(?:DOB|BIRTH\s*DATE|DATE\s*OF\s*BIRTH)\s*:\s*(\d{8})",
+                line, re.IGNORECASE,
+            )
+            if match:
+                raw = match.group(1)
+                return f"{raw[4:6]}/{raw[6:8]}/{raw[0:4]}"
+        return ""
+
+    def _extract_arrest_records(self):
+        records = []
+        current_block = []
+        in_records_section = False
+        for line in self.lines:
+            if "** END OF RAP SHEET **" in line or "END OF RECORD" in line.upper():
+                break
+            stripped = line.strip().upper()
+            if ("ARREST" in stripped and "DATE" in stripped) or "ARREST RECORD" in stripped:
+                in_records_section = True
+                continue
+            if not in_records_section:
+                continue
+            if re.match(r"^\s*[-=]{5,}\s*$", line):
+                if current_block:
+                    record = self._parse_record_block(current_block)
+                    if record:
+                        records.append(record)
+                    current_block = []
+            else:
+                if line.strip():
+                    current_block.append(line)
+        if current_block:
+            record = self._parse_record_block(current_block)
+            if record:
+                records.append(record)
+        return records
+
+    def _parse_record_block(self, lines):
+        if not lines:
+            return None
+        block_text = "\n".join(lines)
+        arrest_date = ""
+        agency = ""
+        charges = []
+        disposition = ""
+
+        for pattern in [r"ARREST\s+DATE\s*:\s*(\d{2}/\d{2}/\d{4})", r"ARREST\s+DATE\s*:\s*(\d{2}-\d{2}-\d{4})",
+                        r"ARR\s*DT\s*:\s*(\d{2}/\d{2}/\d{4})", r"(\d{2}/\d{2}/\d{4})"]:
+            match = re.search(pattern, block_text, re.IGNORECASE)
+            if match:
+                arrest_date = match.group(1)
+                break
+
+        for pattern in [r"AGENCY\s*:\s*(.+?)(?:\n|$)", r"AGY\s*:\s*(.+?)(?:\n|$)",
+                        r"ARRESTING\s+AGENCY\s*:\s*(.+?)(?:\n|$)"]:
+            match = re.search(pattern, block_text, re.IGNORECASE)
+            if match:
+                agency = match.group(1).strip()
+                break
+
+        for match in re.finditer(r"CHARGE\s+\d+\s*:\s*(.+?)(?:\n|$)", block_text, re.IGNORECASE):
+            charge_text = match.group(1).strip()
+            if charge_text:
+                charges.append(charge_text)
+
+        if not charges:
+            for match in re.finditer(r"(?:R\.S\.\s*\d+[:\-]\d+[:\-]?\d*)\s*(.+?)(?:\n|$)", block_text):
+                charges.append(match.group(0).strip())
+
+        for pattern in [r"DISPOSITION\s*:\s*(.+?)(?:\n\n|\n[A-Z]{3,}|$)", r"DISP\s*:\s*(.+?)(?:\n|$)",
+                        r"COURT\s+ACTION\s*:\s*(.+?)(?:\n|$)"]:
+            match = re.search(pattern, block_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                disposition = match.group(1).strip()
+                break
+
+        if arrest_date or agency:
+            return CriminalRecord(
+                arrest_date=arrest_date or "Unknown", agency=agency or "Unknown",
+                charges=charges if charges else ["No charge details available"],
+                disposition=disposition,
+            )
+        return None
+
+
+# --- LAPS Browser Session ---
+
+class LAPSBrowserSession:
+    """Manages Playwright browser session for LAPS portal login and navigation."""
+
+    def __init__(self):
+        self._playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self._initialized = False
+
+    async def initialize(self):
+        try:
+            self._playwright = await async_playwright().start()
+            self.browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"],
+            )
+            self.context = await self.browser.new_context(
+                viewport={"width": 1280, "height": 900}, java_script_enabled=True,
+            )
+            self.page = await self.context.new_page()
+            self.page.set_default_timeout(LAPS_PLAYWRIGHT_TIMEOUT)
+            self._initialized = True
+            laps_logger.info("Browser initialized (headless Chromium)")
+            return True
+        except Exception as e:
+            laps_logger.error("Failed to initialize browser: %s", e)
+            return False
+
+    async def cleanup(self):
+        for obj_name in ("page", "context", "browser"):
+            try:
+                obj = getattr(self, obj_name)
+                if obj:
+                    await obj.close()
+                    setattr(self, obj_name, None)
+            except Exception:
+                pass
+        try:
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
+        except Exception:
+            pass
+        self._initialized = False
+
+    async def login(self, username, password):
+        """3-step LAPS login: creds -> token challenge -> dashboard."""
+        if not self.page or not self._initialized:
+            return False
+        try:
+            await self.page.goto(LAPS_PORTAL_URL, wait_until="domcontentloaded")
+            await self.page.wait_for_selector('input[name="T$CU_USER"]', timeout=LAPS_PLAYWRIGHT_TIMEOUT)
+            await self.page.fill('input[name="T$CU_USER"]', username)
+            await self.page.fill('input[name="T$CU_PASS"]', password)
+            await self.page.click('input[name="T$CU_SEND"]')
+            await self.page.wait_for_load_state("networkidle", timeout=LAPS_PLAYWRIGHT_TIMEOUT)
+
+            content = await self.page.content()
+            token_match = re.search(
+                r"[Ee]nter\s+(?:the\s+)?token\s+(?:at\s+(?:position\s+)?)?([A-Ja-j])[\s-]*(\d)", content,
+            )
+
+            if not token_match:
+                if "Recently Completed" in content or "Dashboard" in content:
+                    return True
+                if any(w in content.lower() for w in ("invalid", "incorrect", "failed")):
+                    laps_logger.error("LAPS login rejected")
+                    return False
+                return False
+
+            col_letter = token_match.group(1).upper()
+            row_number = token_match.group(2)
+            laps_logger.info("Token challenge: position %s%s", col_letter, row_number)
+
+            if row_number not in LAPS_TOKEN_GRID or col_letter not in LAPS_TOKEN_GRID[row_number]:
+                laps_logger.error("Token grid position not found")
+                return False
+
+            token_value = LAPS_TOKEN_GRID[row_number][col_letter]
+            token_filled = False
+            for selector in ['input[name="T$CU_TOKEN"]', 'input[name*="TOKEN"]',
+                             'input[type="text"]:not([name="T$CU_USER"]):not([name="T$CU_PASS"])',
+                             'input[type="password"]']:
+                try:
+                    elem = await self.page.query_selector(selector)
+                    if elem:
+                        await elem.fill(token_value)
+                        token_filled = True
+                        break
+                except Exception:
+                    continue
+
+            _secure_zero_string(token_value)
+            del token_value
+            if not token_filled:
+                return False
+
+            await self.page.click('input[name="T$CU_SEND"]')
+            await self.page.wait_for_load_state("networkidle", timeout=LAPS_PLAYWRIGHT_TIMEOUT)
+
+            dashboard_content = await self.page.content()
+            if "Recently Completed" in dashboard_content or "Dashboard" in dashboard_content:
+                laps_logger.info("LAPS login successful")
+                return True
+            if any(w in dashboard_content.lower() for w in ("invalid", "incorrect")):
+                return False
+            return True
+        except Exception as e:
+            laps_logger.error("Login failed: %s", e)
+            return False
+
+    async def get_recently_completed(self):
+        """Navigate to Recently Completed tab and extract applicant entries."""
+        if not self.page:
+            return []
+        try:
+            clicked = False
+            for selector in ['a:has-text("Recently Completed")', 'button:has-text("Recently Completed")',
+                             'td:has-text("Recently Completed")', '[id*="recent"]']:
+                try:
+                    elem = await self.page.query_selector(selector)
+                    if elem:
+                        await elem.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                return []
+
+            await self.page.wait_for_load_state("networkidle", timeout=LAPS_PLAYWRIGHT_TIMEOUT)
+            await asyncio.sleep(1)
+
+            applicant_entries = []
+            links = await self.page.query_selector_all("table a, tr a, .applicant a, a[href]")
+            for link in links:
+                text = await link.text_content()
+                if text and text.strip() and "," in text.strip():
+                    applicant_entries.append({"name": text.strip()})
+
+            if not applicant_entries:
+                rows = await self.page.query_selector_all("tr")
+                for row in rows:
+                    row_text = await row.text_content()
+                    if row_text and "," in row_text:
+                        name_match = re.search(r"([A-Z][A-Z\s'-]+,\s*[A-Z][A-Z\s'-]+)", row_text)
+                        if name_match:
+                            applicant_entries.append({"name": name_match.group(1).strip()})
+
+            laps_logger.info("Found %d applicants in Recently Completed", len(applicant_entries))
+            return applicant_entries
+        except Exception as e:
+            laps_logger.error("Failed to get recently completed: %s", e)
+            return []
+
+    async def get_applicant_details(self, applicant_name):
+        """Click applicant, navigate to details, extract rap sheet text."""
+        if not self.page:
+            return None
+        try:
+            name_link = await self.page.query_selector(f'a:has-text("{applicant_name}")')
+            if not name_link:
+                name_link = await self.page.query_selector(f'a:has-text("{applicant_name[:20]}")')
+            if not name_link:
+                return None
+
+            await name_link.click()
+            await self.page.wait_for_load_state("networkidle", timeout=LAPS_PLAYWRIGHT_TIMEOUT)
+            await asyncio.sleep(0.5)
+
+            for selector in ['button:has-text("Details")', 'input[value="Details"]',
+                             'a:has-text("Details")', '[id*="detail"]']:
+                try:
+                    elem = await self.page.query_selector(selector)
+                    if elem:
+                        await elem.click()
+                        break
+                except Exception:
+                    continue
+
+            await self.page.wait_for_load_state("networkidle", timeout=LAPS_PLAYWRIGHT_TIMEOUT)
+            await asyncio.sleep(1)
+
+            pages = self.context.pages if self.context else []
+            detail_page = self.page
+            if len(pages) > 1:
+                detail_page = pages[-1]
+
+            full_text = await detail_page.inner_text("body")
+            if detail_page != self.page and len(pages) > 1:
+                await detail_page.close()
+
+            if not full_text or len(full_text) < 50:
+                return None
+
+            for marker in ["NON-INVESTIGATIVE", "RAP SHEET", "CRIMINAL HISTORY", "ARREST RECORD", "NAME:", "REQUESTED BY"]:
+                idx = full_text.find(marker)
+                if idx > 0:
+                    full_text = full_text[idx:]
+                    break
+
+            await self._nav_back()
+            return full_text
+        except Exception as e:
+            laps_logger.error("Failed to get details: %s", e)
+            try:
+                await self._nav_back()
+            except Exception:
+                pass
+            return None
+
+    async def _nav_back(self):
+        if not self.page:
+            return
+        try:
+            await self.page.go_back()
+            await self.page.wait_for_load_state("networkidle", timeout=10000)
+            content = await self.page.content()
+            if "Recently Completed" not in content:
+                for sel in ['a:has-text("Recently Completed")', 'button:has-text("Recently Completed")']:
+                    try:
+                        elem = await self.page.query_selector(sel)
+                        if elem:
+                            await elem.click()
+                            await self.page.wait_for_load_state("networkidle", timeout=10000)
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+
+# --- Accio PostResults XML Builder & Pusher ---
+
+def _laps_xml_escape(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+
+_VALID_FILLED_STATUSES = frozenset({"filled", "unfilled", "in progress", "canceled", "failed"})
+
+
+class AccioLAPSPusher:
+    """Builds and pushes criminal history results to Accio PostResults endpoint."""
+    SEARCH_TYPE = "Fingerprint Criminal History"
+
+    def __init__(self):
+        self._base_url = ACCIO_API_BASE_URL.rstrip("/")
+
+    def _build_login_xml(self):
+        return (
+            "<login>"
+            f"<account>{_laps_xml_escape(ACCIO_API_ACCOUNT)}</account>"
+            f"<username>{_laps_xml_escape(ACCIO_API_USERNAME_LAPS)}</username>"
+            f"<password>{_laps_xml_escape(ACCIO_API_PASSWORD_LAPS)}</password>"
+            "</login>"
+        )
+
+    def _build_registration_xml(self):
+        today_str = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%d")
+        return (
+            "<registration>"
+            f"<Company>{_laps_xml_escape(ACCIO_REGISTRATION_COMPANY)}</Company>"
+            "<version>1.0.0</version>"
+            f"<last_changed_date>{today_str}</last_changed_date>"
+            f"<access_key>{_laps_xml_escape(ACCIO_REGISTRATION_KEY)}</access_key>"
+            "<contacts><business><name/><phone_number/><email/></business>"
+            "<technical><name/><phone_number/><email/></technical></contacts>"
+            "</registration>"
+        )
+
+    def _build_verified_items(self, rap_sheet):
+        items = []
+        items.append(f"<verifieditem><fieldname>Record Status</fieldname>"
+                     f"<fieldvalue>{_laps_xml_escape(rap_sheet.status.value)}</fieldvalue></verifieditem>")
+        if rap_sheet.records:
+            for i, record in enumerate(rap_sheet.records, 1):
+                items.append(f"<verifieditem><fieldname>Arrest #{i} - Date</fieldname>"
+                             f"<fieldvalue>{_laps_xml_escape(record.arrest_date)}</fieldvalue></verifieditem>")
+                items.append(f"<verifieditem><fieldname>Arrest #{i} - Agency</fieldname>"
+                             f"<fieldvalue>{_laps_xml_escape(record.agency)}</fieldvalue></verifieditem>")
+                if record.charges:
+                    for j, charge in enumerate(record.charges, 1):
+                        items.append(f"<verifieditem><fieldname>Arrest #{i} - Charge {j}</fieldname>"
+                                     f"<fieldvalue>{_laps_xml_escape(charge)}</fieldvalue></verifieditem>")
+                else:
+                    items.append(f"<verifieditem><fieldname>Arrest #{i} - Charges</fieldname>"
+                                 f"<fieldvalue></fieldvalue></verifieditem>")
+                items.append(f"<verifieditem><fieldname>Arrest #{i} - Disposition</fieldname>"
+                             f"<fieldvalue>{_laps_xml_escape(record.disposition)}</fieldvalue></verifieditem>")
+        items.append(f"<verifieditem><fieldname>Search Date</fieldname>"
+                     f"<fieldvalue>{_laps_xml_escape(rap_sheet.extracted_at)}</fieldvalue></verifieditem>")
+        return "".join(items)
+
+    def _build_note_text(self, rap_sheet):
+        if rap_sheet.status == CriminalHistoryStatus.CLEAR:
+            dob_line = f"\nDOB: {rap_sheet.subject_dob}" if rap_sheet.subject_dob else ""
+            return (
+                "=== LOUISIANA LAPS - NO CRIMINAL HISTORY ===\n\n"
+                "No criminal arrest records were found in the\n"
+                "Louisiana Applicant Processing System (LAPS)\n"
+                "for the submitted applicant.\n\n"
+                f"Searched: {rap_sheet.extracted_at}{dob_line}"
+            )
+        dob_line = f"DOB: {rap_sheet.subject_dob}\n" if rap_sheet.subject_dob else ""
+        lines = ["=== LOUISIANA LAPS - CRIMINAL HISTORY FOUND ===", "",
+                 f"{dob_line}Total Arrests: {len(rap_sheet.records)}", ""]
+        for i, record in enumerate(rap_sheet.records, 1):
+            lines.append(f"--- Arrest #{i} ---")
+            lines.append(f"Date: {record.arrest_date}")
+            lines.append(f"Agency: {record.agency}")
+            for j, charge in enumerate(record.charges, 1):
+                lines.append(f"  Charge {j}: {charge}")
+            lines.append(f"Disposition: {record.disposition or 'Not available'}")
+            lines.append("")
+        lines.append(f"Searched: {rap_sheet.extracted_at}")
+        return "\n".join(lines)
+
+    async def push_result(self, order_number, sub_order_number, rap_sheet):
+        """Push criminal history result to Accio PostResults."""
+        if rap_sheet.status == CriminalHistoryStatus.CLEAR:
+            filled_status, filled_code = "filled", "Clear"
+        elif rap_sheet.status == CriminalHistoryStatus.HITS:
+            filled_status, filled_code = "filled", "Hits"
+        else:
+            filled_status, filled_code = "failed", "Error"
+
+        if filled_status not in _VALID_FILLED_STATUSES:
+            laps_logger.error("BLOCKED: Invalid filledStatus '%s'", filled_status)
+            return False
+
+        note_text = self._build_note_text(rap_sheet)
+        verified_xml = self._build_verified_items(rap_sheet)
+
+        request_xml = (
+            "<?xml version='1.0' encoding='UTF-8'?>"
+            "<ScreeningResults>"
+            f"<mode>{_laps_xml_escape(ACCIO_API_MODE)}</mode>"
+            f"{self._build_login_xml()}"
+            f"{self._build_registration_xml()}"
+            f'<postResults order="{_laps_xml_escape(order_number)}"'
+            f' subOrder="{_laps_xml_escape(sub_order_number)}"'
+            f' type="{_laps_xml_escape(self.SEARCH_TYPE)}"'
+            f' filledStatus="{_laps_xml_escape(filled_status)}"'
+            f' filledCode="{_laps_xml_escape(filled_code)}">'
+            f"<notes_from_vendor_to_screeningfirm>{_laps_xml_escape(note_text)}</notes_from_vendor_to_screeningfirm>"
+            f"<text>{_laps_xml_escape(note_text)}</text>"
+            f"{verified_xml}"
+            "</postResults>"
+            "</ScreeningResults>"
+        )
+
+        url = f"{self._base_url}{ACCIO_POSTRESULTS_PATH}"
+        for attempt in range(1, LAPS_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(LAPS_HTTP_TIMEOUT), verify=True) as client:
+                    response = await client.post(url, content=request_xml, headers={"Content-Type": "text/xml"})
+
+                laps_logger.info("Accio POST attempt %d/%d -> HTTP %d", attempt, LAPS_MAX_RETRIES, response.status_code)
+
+                if response.status_code >= 500:
+                    if attempt < LAPS_MAX_RETRIES:
+                        await asyncio.sleep(LAPS_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+                        continue
+                    return False
+                if response.status_code >= 400:
+                    return False
+
+                try:
+                    root = ET.fromstring(response.text)
+                    if root.findall(".//error"):
+                        for err in root.findall(".//error"):
+                            laps_logger.error("Accio error: %s", err.findtext("errortext", "?"))
+                        return False
+                except ET.ParseError:
+                    pass
+
+                laps_logger.info("Accio PostResults accepted (order %s)", order_number)
+                return True
+            except Exception as e:
+                laps_logger.error("Accio push error: %s", e)
+                if attempt < LAPS_MAX_RETRIES:
+                    await asyncio.sleep(LAPS_RETRY_BASE_DELAY * attempt)
+                    continue
+                return False
+        return False
+
+
+# --- LAPS Retriever Orchestrator ---
+
+class LAPSRetriever:
+    """Main orchestrator: Login -> fetch -> parse -> match -> push -> cleanup."""
+
+    def __init__(self):
+        self.laps_db = LAPSDB()
+        self.pusher = AccioLAPSPusher()
+
+    async def run_cycle(self):
+        summary = {
+            "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
+            "processed": 0, "matched": 0, "pushed": 0,
+            "skipped": 0, "failed": 0, "errors": [],
+        }
+
+        cycle_id = self.laps_db.log_cycle_start()
+        session = LAPSBrowserSession()
+
+        if not await session.initialize():
+            summary["errors"].append("Browser initialization failed")
+            if cycle_id:
+                self.laps_db.log_cycle_end(cycle_id, summary)
+            return summary
+
+        try:
+            with SecurePassword(LAPS_PASSWORD) as pwd:
+                login_ok = await session.login(LAPS_USERNAME, pwd.get())
+
+            if not login_ok:
+                summary["errors"].append("LAPS login failed")
+                return summary
+
+            entries = await session.get_recently_completed()
+            if not entries:
+                laps_logger.info("No recently completed applicants found")
+                return summary
+
+            laps_logger.info("Processing %d applicant(s)...", len(entries))
+
+            for entry in entries:
+                laps_name = entry.get("name", "")
+                if not laps_name:
+                    continue
+
+                summary["processed"] += 1
+                rap_text = None
+
+                try:
+                    rap_text = await session.get_applicant_details(laps_name)
+                    if not rap_text:
+                        summary["failed"] += 1
+                        continue
+
+                    parser = RapSheetParser(rap_text)
+                    rap_sheet = parser.parse()
+                    laps_logger.info("Parsed: status=%s, arrests=%d", rap_sheet.status.value, len(rap_sheet.records))
+
+                    first_name, last_name = _parse_laps_name(rap_sheet.subject_name or laps_name)
+                    applicant = self.laps_db.find_matching_applicant(last_name, first_name, rap_sheet.subject_ssn_last4)
+
+                    if not applicant:
+                        laps_logger.info("No matching FP Release applicant found")
+                        summary["skipped"] += 1
+                        continue
+
+                    summary["matched"] += 1
+                    push_ok = await self.pusher.push_result(
+                        applicant.accio_order_number, applicant.accio_sub_order or "1", rap_sheet,
+                    )
+
+                    if push_ok:
+                        summary["pushed"] += 1
+                        self.laps_db.update_applicant_laps_status(applicant.id, rap_sheet.status.value)
+                    else:
+                        summary["failed"] += 1
+                        self.laps_db.update_applicant_laps_status(applicant.id, "error")
+
+                    if cycle_id:
+                        self.laps_db.log_result(
+                            applicant.id, cycle_id, laps_name, rap_sheet.status.value,
+                            len(rap_sheet.records), push_ok,
+                        )
+                except Exception as e:
+                    laps_logger.error("Error processing applicant: %s", e)
+                    summary["failed"] += 1
+                    summary["errors"].append(str(e))
+                finally:
+                    if rap_text:
+                        _secure_zero_string(rap_text)
+                        rap_text = None
+                    gc.collect()
+        finally:
+            await session.cleanup()
+            gc.collect()
+            if cycle_id:
+                self.laps_db.log_cycle_end(cycle_id, summary)
+
+        return summary
+
+
+# --- LAPS Background Worker Thread ---
+
+_laps_worker_running = False
+_laps_last_summary = None
+_laps_next_run = None
+
+
+def _run_laps_async_cycle():
+    """Run one async LAPS cycle in a new event loop (called from background thread)."""
+    global _laps_last_summary
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        retriever = LAPSRetriever()
+        summary = loop.run_until_complete(retriever.run_cycle())
+        _laps_last_summary = summary
+        laps_logger.info(
+            "Cycle complete: processed=%d matched=%d pushed=%d skipped=%d failed=%d",
+            summary["processed"], summary["matched"], summary["pushed"],
+            summary["skipped"], summary["failed"],
+        )
+    except Exception as e:
+        laps_logger.error("LAPS cycle failed: %s", e)
+        _laps_last_summary = {"timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
+                              "processed": 0, "matched": 0, "pushed": 0,
+                              "skipped": 0, "failed": 0, "errors": [str(e)]}
+    finally:
+        loop.close()
+
+
+def _laps_worker_loop():
+    """Background thread: run LAPS retrieval cycles on an hourly schedule."""
+    global _laps_worker_running, _laps_next_run
+    _laps_worker_running = True
+    laps_logger.info("LAPS background worker started (interval: %ds)", LAPS_HOURLY_INTERVAL)
+
+    while _laps_worker_running:
+        laps_logger.info("Starting LAPS retrieval cycle...")
+        try:
+            _run_laps_async_cycle()
+        except Exception as e:
+            laps_logger.error("Unhandled error in LAPS worker: %s", e)
+
+        gc.collect()
+        _laps_next_run = datetime.now(ZoneInfo("UTC")) + timedelta(seconds=LAPS_HOURLY_INTERVAL)
+        laps_logger.info("Next LAPS cycle at %s", _laps_next_run.isoformat())
+
+        for _ in range(LAPS_HOURLY_INTERVAL):
+            if not _laps_worker_running:
+                break
+            time.sleep(1)
+
+    laps_logger.info("LAPS background worker stopped")
+
+
+def start_laps_worker():
+    """Start the LAPS retrieval background worker thread."""
+    if not LAPS_ENABLED:
+        laps_logger.info("LAPS Retriever is DISABLED (set LAPS_ENABLED=true to enable)")
+        return
+
+    missing_vars = []
+    if not LAPS_USERNAME:
+        missing_vars.append("LAPS_USERNAME")
+    if not LAPS_PASSWORD:
+        missing_vars.append("LAPS_PASSWORD")
+    if not ACCIO_API_BASE_URL:
+        missing_vars.append("ACCIO_API_BASE_URL")
+    if not ACCIO_API_ACCOUNT:
+        missing_vars.append("ACCIO_API_ACCOUNT")
+
+    if missing_vars:
+        laps_logger.warning("LAPS worker NOT started — missing env vars: %s", ", ".join(missing_vars))
+        return
+
+    if not HAS_PLAYWRIGHT:
+        laps_logger.warning("LAPS worker NOT started — playwright not installed")
+        return
+    if not HAS_HTTPX:
+        laps_logger.warning("LAPS worker NOT started — httpx not installed")
+        return
+
+    t = threading.Thread(target=_laps_worker_loop, daemon=True, name="laps-worker")
+    t.start()
+    laps_logger.info("LAPS background worker thread started")
+
+
+def trigger_laps_cycle_manual():
+    """Trigger a single LAPS cycle manually (runs in a separate thread)."""
+    t = threading.Thread(target=_run_laps_async_cycle, daemon=True, name="laps-manual")
+    t.start()
+    return True
+
+
+# --- LAPS Dashboard Page ---
+
+def page_laps_dashboard(db, nav_user=None):
+    """LAPS Retriever dashboard page."""
+    global _laps_last_summary, _laps_next_run, _laps_worker_running
+
+    # Get LAPS stats from DB
+    try:
+        pending_row = db.execute(
+            "SELECT COUNT(*) as cnt FROM applicants WHERE email_sent = TRUE AND laps_status IS NULL"
+        ).fetchone()
+        pending_count = pending_row["cnt"] if pending_row else 0
+    except Exception:
+        pending_count = 0
+
+    try:
+        clear_row = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE laps_status = 'Clear'").fetchone()
+        clear_count = clear_row["cnt"] if clear_row else 0
+    except Exception:
+        clear_count = 0
+
+    try:
+        hits_row = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE laps_status = 'Hits'").fetchone()
+        hits_count = hits_row["cnt"] if hits_row else 0
+    except Exception:
+        hits_count = 0
+
+    try:
+        error_row = db.execute("SELECT COUNT(*) as cnt FROM applicants WHERE laps_status = 'error'").fetchone()
+        error_count = error_row["cnt"] if error_row else 0
+    except Exception:
+        error_count = 0
+
+    # Recent cycles
+    try:
+        cycles = db.execute("""
+            SELECT * FROM laps_cycle_log ORDER BY started_at DESC LIMIT 10
+        """).fetchall()
+    except Exception:
+        cycles = []
+
+    # Recent results
+    try:
+        results = db.execute("""
+            SELECT lr.*, a.first_name, a.last_name, a.accio_order_number
+            FROM laps_result_log lr
+            LEFT JOIN applicants a ON lr.applicant_id = a.id
+            ORDER BY lr.created_at DESC LIMIT 20
+        """).fetchall()
+    except Exception:
+        results = []
+
+    # Worker status
+    worker_status = "Running" if _laps_worker_running else "Stopped"
+    worker_color = "#16a34a" if _laps_worker_running else "#dc2626"
+    next_run_str = _laps_next_run.strftime("%I:%M %p %Z") if _laps_next_run else "N/A"
+
+    last_summary_html = ""
+    if _laps_last_summary:
+        ls = _laps_last_summary
+        last_summary_html = f"""
+        <div style="background: var(--gray-50); padding: 1rem; border-radius: 8px; margin-top: 1rem;">
+            <strong>Last Cycle:</strong> {h(ls.get('timestamp', 'N/A')[:19])}<br>
+            Processed: {ls.get('processed', 0)} |
+            Matched: {ls.get('matched', 0)} |
+            Pushed: {ls.get('pushed', 0)} |
+            Skipped: {ls.get('skipped', 0)} |
+            Failed: {ls.get('failed', 0)}
+            {'<br><span style="color:#dc2626;">Errors: ' + h("; ".join(ls.get("errors", []))) + '</span>' if ls.get("errors") else ''}
+        </div>
+        """
+
+    # Cycle history table
+    cycle_rows = ""
+    for c in cycles:
+        started = c["started_at"].strftime("%m/%d %I:%M %p") if c.get("started_at") else "?"
+        finished = c["finished_at"].strftime("%I:%M %p") if c.get("finished_at") else "running..."
+        status_badge = f'<span style="color:{"#16a34a" if c.get("status","") == "completed" else "#f59e0b"}">{h(c.get("status", "?"))}</span>'
+        cycle_rows += f"""
+        <tr>
+            <td>{c.get('id','')}</td>
+            <td>{started}</td>
+            <td>{finished}</td>
+            <td>{c.get('processed', 0)}</td>
+            <td>{c.get('matched', 0)}</td>
+            <td>{c.get('pushed', 0)}</td>
+            <td>{c.get('failed', 0)}</td>
+            <td>{status_badge}</td>
+        </tr>"""
+
+    # Results table
+    result_rows = ""
+    for r in results:
+        name_display = f"{h(r.get('first_name',''))} {h(r.get('last_name',''))}" if r.get('first_name') else h(r.get('laps_name', 'N/A'))
+        status_color = "#16a34a" if r.get("laps_status") == "Clear" else "#dc2626" if r.get("laps_status") == "Hits" else "#f59e0b"
+        push_icon = '<i class="fas fa-check-circle" style="color:#16a34a"></i>' if r.get("accio_push_ok") else '<i class="fas fa-times-circle" style="color:#dc2626"></i>'
+        created = r["created_at"].strftime("%m/%d %I:%M %p") if r.get("created_at") else "?"
+        result_rows += f"""
+        <tr>
+            <td>{name_display}</td>
+            <td style="color:{status_color}; font-weight:600;">{h(r.get('laps_status',''))}</td>
+            <td>{r.get('record_count', 0)}</td>
+            <td>{push_icon}</td>
+            <td>{h(r.get('accio_order_number', ''))}</td>
+            <td>{created}</td>
+        </tr>"""
+
+    # Applicants awaiting LAPS
+    try:
+        awaiting = db.execute("""
+            SELECT id, first_name, last_name, accio_order_number, email_sent_at, created_at
+            FROM applicants
+            WHERE email_sent = TRUE AND laps_status IS NULL
+            ORDER BY email_sent_at DESC
+            LIMIT 20
+        """).fetchall()
+    except Exception:
+        awaiting = []
+
+    awaiting_rows = ""
+    for a in awaiting:
+        sent_at = a["email_sent_at"].strftime("%m/%d %I:%M %p") if a.get("email_sent_at") else "N/A"
+        awaiting_rows += f"""
+        <tr>
+            <td>{a['id']}</td>
+            <td>{h(a.get('first_name',''))} {h(a.get('last_name',''))}</td>
+            <td>{h(a.get('accio_order_number',''))}</td>
+            <td>{sent_at}</td>
+            <td><span style="color:#f59e0b; font-weight:600;">Awaiting LAPS</span></td>
+        </tr>"""
+
+    content = f"""
+    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:1rem; margin-bottom:2rem;">
+        <div class="card" style="text-align:center;">
+            <div style="font-size:2rem; font-weight:700; color:#f59e0b;">{pending_count}</div>
+            <div style="color:var(--gray-500);">Awaiting LAPS</div>
+        </div>
+        <div class="card" style="text-align:center;">
+            <div style="font-size:2rem; font-weight:700; color:#16a34a;">{clear_count}</div>
+            <div style="color:var(--gray-500);">Clear</div>
+        </div>
+        <div class="card" style="text-align:center;">
+            <div style="font-size:2rem; font-weight:700; color:#dc2626;">{hits_count}</div>
+            <div style="color:var(--gray-500);">Hits</div>
+        </div>
+        <div class="card" style="text-align:center;">
+            <div style="font-size:2rem; font-weight:700; color:#6b7280;">{error_count}</div>
+            <div style="color:var(--gray-500);">Errors</div>
+        </div>
+    </div>
+
+    <div class="card" style="margin-bottom:2rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+            <h2 style="margin:0;"><i class="fas fa-robot"></i> LAPS Worker</h2>
+            <form method="POST" action="/laps/trigger" style="display:inline;">
+                <button type="submit" class="btn btn-primary" style="font-size:0.9rem;">
+                    <i class="fas fa-play"></i> Run Now
+                </button>
+            </form>
+        </div>
+        <div style="display:flex; gap:2rem; flex-wrap:wrap;">
+            <div>
+                <strong>Status:</strong>
+                <span style="color:{worker_color}; font-weight:600;">
+                    <i class="fas fa-{'circle' if _laps_worker_running else 'stop-circle'}"></i> {worker_status}
+                </span>
+            </div>
+            <div><strong>Next Run:</strong> {next_run_str}</div>
+            <div><strong>Interval:</strong> {LAPS_HOURLY_INTERVAL // 60} minutes</div>
+        </div>
+        {last_summary_html}
+    </div>
+
+    <div class="card" style="margin-bottom:2rem;">
+        <h2 style="margin-bottom:1rem;"><i class="fas fa-history"></i> Recent Cycles</h2>
+        <div style="overflow-x:auto;">
+            <table style="width:100%; border-collapse:collapse;">
+                <thead>
+                    <tr style="border-bottom:2px solid var(--gray-200); text-align:left;">
+                        <th style="padding:8px;">ID</th>
+                        <th style="padding:8px;">Started</th>
+                        <th style="padding:8px;">Finished</th>
+                        <th style="padding:8px;">Processed</th>
+                        <th style="padding:8px;">Matched</th>
+                        <th style="padding:8px;">Pushed</th>
+                        <th style="padding:8px;">Failed</th>
+                        <th style="padding:8px;">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {cycle_rows if cycle_rows else '<tr><td colspan="8" style="padding:1rem; text-align:center; color:var(--gray-400);">No cycles yet — worker will run on schedule</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card" style="margin-bottom:2rem;">
+        <h2 style="margin-bottom:1rem;"><i class="fas fa-clock"></i> Applicants Awaiting LAPS</h2>
+        <div style="overflow-x:auto;">
+            <table style="width:100%; border-collapse:collapse;">
+                <thead>
+                    <tr style="border-bottom:2px solid var(--gray-200); text-align:left;">
+                        <th style="padding:8px;">ID</th>
+                        <th style="padding:8px;">Name</th>
+                        <th style="padding:8px;">Accio Order</th>
+                        <th style="padding:8px;">Email Sent</th>
+                        <th style="padding:8px;">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {awaiting_rows if awaiting_rows else '<tr><td colspan="5" style="padding:1rem; text-align:center; color:var(--gray-400);">No applicants awaiting LAPS retrieval</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2 style="margin-bottom:1rem;"><i class="fas fa-list-check"></i> Recent LAPS Results</h2>
+        <div style="overflow-x:auto;">
+            <table style="width:100%; border-collapse:collapse;">
+                <thead>
+                    <tr style="border-bottom:2px solid var(--gray-200); text-align:left;">
+                        <th style="padding:8px;">Applicant</th>
+                        <th style="padding:8px;">Status</th>
+                        <th style="padding:8px;">Records</th>
+                        <th style="padding:8px;">Accio Push</th>
+                        <th style="padding:8px;">Order #</th>
+                        <th style="padding:8px;">Date</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {result_rows if result_rows else '<tr><td colspan="6" style="padding:1rem; text-align:center; color:var(--gray-400);">No LAPS results yet</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    """
+    return render_page("LAPS Retriever", content, active="laps", user=nav_user)
+
+
 def render_page(title, content, active="", user=None):
     """Render a full page with navigation."""
     username_display = h(user["username"]) if user else ""
@@ -1407,152 +2733,83 @@ def render_page(title, content, active="", user=None):
         <title>{h(title)} - Fingerprint Release Manager</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
         <style>
-            /* === FUTURISTIC DARK THEME — FP Release v3.0 === */
             :root {{
-                --primary: #00d4ff;           /* Electric cyan accent */
-                --primary-dark: #00a8cc;
-                --primary-glow: rgba(0, 212, 255, 0.15);
-                --accent-purple: #a855f7;     /* Neon purple secondary */
-                --accent-teal: #2dd4bf;        /* Soft teal highlight */
-                --success: #00e68a;
-                --danger: #ff4d6a;
-                --warning: #ffb020;
-                --surface-0: #0a0e1a;         /* Deepest background */
-                --surface-1: #111827;         /* Sidebar / panels */
-                --surface-2: #1a2035;         /* Cards */
-                --surface-3: #222b45;         /* Elevated surfaces */
-                --glass: rgba(26, 32, 53, 0.65); /* Glassmorphism base */
-                --glass-border: rgba(0, 212, 255, 0.12);
-                --border: rgba(255,255,255,0.06);
-                --border-hover: rgba(0, 212, 255, 0.25);
-                --text-primary: #e8ecf4;
-                --text-secondary: #8892a8;
-                --text-muted: #5a6478;
-                /* Legacy aliases for inline styles that reference old vars */
-                --gray-50: var(--surface-3);
-                --gray-100: var(--surface-2);
-                --gray-200: var(--border);
-                --gray-300: var(--text-muted);
-                --gray-400: var(--text-secondary);
-                --gray-500: var(--text-secondary);
-                --gray-700: var(--text-secondary);
-                --gray-900: var(--text-primary);
+                --primary: #2563eb;
+                --primary-dark: #1e40af;
+                --success: #10b981;
+                --danger: #ef4444;
+                --warning: #f59e0b;
+                --gray-50: #f9fafb;
+                --gray-100: #f3f4f6;
+                --gray-200: #e5e7eb;
+                --gray-300: #d1d5db;
+                --gray-400: #9ca3af;
+                --gray-500: #6b7280;
+                --gray-700: #374151;
+                --gray-900: #111827;
             }}
             * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--surface-0); color: var(--text-primary); letter-spacing: 0.01em; }}
-
-            /* --- Layout --- */
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--gray-50); color: var(--gray-900); }}
             .container {{ display: flex; min-height: 100vh; }}
-
-            /* --- Sidebar: matte dark with subtle glow accents --- */
-            .sidebar {{ width: 250px; background: linear-gradient(180deg, var(--surface-1) 0%, #0d1225 100%); color: white; padding: 2rem 0; overflow-y: auto; box-shadow: 2px 0 20px rgba(0,0,0,0.4); border-right: 1px solid var(--glass-border); position: relative; }}
-            .sidebar::after {{ content: ''; position: absolute; top: 0; right: 0; width: 1px; height: 100%; background: linear-gradient(180deg, var(--primary) 0%, transparent 50%, var(--accent-purple) 100%); opacity: 0.3; }}
-            .sidebar-brand {{ padding: 0 1.5rem 2rem; font-size: 1.5rem; font-weight: bold; display: flex; align-items: center; gap: 0.5rem; border-bottom: 1px solid rgba(255,255,255,0.06); }}
-            .sidebar-brand i {{ color: var(--primary); filter: drop-shadow(0 0 6px rgba(0, 212, 255, 0.5)); }}
-            .sidebar-brand span {{ background: linear-gradient(135deg, var(--primary), var(--accent-purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }}
+            .sidebar {{ width: 250px; background: var(--gray-900); color: white; padding: 2rem 0; overflow-y: auto; box-shadow: 2px 0 8px rgba(0,0,0,0.1); }}
+            .sidebar-brand {{ padding: 0 1.5rem 2rem; font-size: 1.5rem; font-weight: bold; display: flex; align-items: center; gap: 0.5rem; border-bottom: 1px solid var(--gray-700); }}
+            .sidebar-brand i {{ color: var(--primary); }}
             .sidebar-nav {{ list-style: none; padding: 1rem 0; }}
             .sidebar-nav li {{ margin: 0; }}
-            .sidebar-nav a {{ display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.5rem; color: var(--text-secondary); text-decoration: none; transition: all 0.3s ease; border-left: 3px solid transparent; }}
-            .sidebar-nav a:hover {{ color: var(--primary); background: var(--primary-glow); padding-left: 1.75rem; }}
-            .sidebar-nav a.active {{ color: var(--primary); background: var(--primary-glow); border-left: 3px solid var(--primary); padding-left: 1.5rem; box-shadow: inset 0 0 20px rgba(0,212,255,0.05); }}
-            .sidebar-nav a.active i {{ filter: drop-shadow(0 0 4px rgba(0, 212, 255, 0.4)); }}
-
-            /* --- Main content area --- */
-            .main {{ flex: 1; display: flex; flex-direction: column; background: var(--surface-0); }}
-
-            /* --- Top bar: frosted glass --- */
-            .topbar {{ background: var(--glass); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); padding: 1rem 2rem; border-bottom: 1px solid var(--glass-border); display: flex; justify-content: space-between; align-items: center; }}
-            .topbar-user {{ display: flex; align-items: center; gap: 1rem; color: var(--text-secondary); }}
-            .topbar-user a {{ color: var(--primary); text-decoration: none; font-size: 0.875rem; transition: all 0.2s; }}
-            .topbar-user a:hover {{ color: var(--accent-teal); text-shadow: 0 0 8px rgba(0,212,255,0.3); }}
-
+            .sidebar-nav a {{ display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.5rem; color: var(--gray-300); text-decoration: none; transition: all 0.2s; }}
+            .sidebar-nav a:hover {{ color: white; background: rgba(37, 99, 235, 0.1); padding-left: 1.75rem; }}
+            .sidebar-nav a.active {{ color: var(--primary); background: rgba(37, 99, 235, 0.1); border-left: 3px solid var(--primary); padding-left: 1.5rem; }}
+            .main {{ flex: 1; display: flex; flex-direction: column; }}
+            .topbar {{ background: white; padding: 1rem 2rem; border-bottom: 1px solid var(--gray-200); display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
+            .topbar-user {{ display: flex; align-items: center; gap: 1rem; }}
+            .topbar-user a {{ color: var(--primary); text-decoration: none; font-size: 0.875rem; }}
+            .topbar-user a:hover {{ text-decoration: underline; }}
             .content {{ flex: 1; overflow-y: auto; padding: 2rem; }}
-            .page-title {{ font-size: 2rem; font-weight: bold; margin-bottom: 1.5rem; color: var(--text-primary); letter-spacing: 0.02em; }}
-            .page-title i {{ color: var(--primary); filter: drop-shadow(0 0 8px rgba(0,212,255,0.4)); }}
-
-            /* --- Alerts with glow borders --- */
-            .alert {{ padding: 1rem; border-radius: 0.75rem; margin-bottom: 1rem; display: flex; gap: 0.75rem; align-items: flex-start; backdrop-filter: blur(8px); }}
-            .alert-success {{ background: rgba(0, 230, 138, 0.08); border: 1px solid rgba(0,230,138,0.3); color: var(--success); box-shadow: 0 0 15px rgba(0,230,138,0.05); }}
-            .alert-error {{ background: rgba(255, 77, 106, 0.08); border: 1px solid rgba(255,77,106,0.3); color: var(--danger); box-shadow: 0 0 15px rgba(255,77,106,0.05); }}
-
-            /* --- Cards: glassmorphism with 3D depth --- */
-            .card {{ background: var(--glass); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid var(--glass-border); border-radius: 0.75rem; box-shadow: 0 4px 24px rgba(0,0,0,0.3), 0 1px 0 rgba(255,255,255,0.03) inset; padding: 1.5rem; margin-bottom: 1.5rem; transition: border-color 0.3s ease, box-shadow 0.3s ease; }}
-            .card:hover {{ border-color: var(--border-hover); box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 20px rgba(0,212,255,0.03); }}
-            .card-title {{ font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; color: var(--text-primary); }}
-            .card-title i {{ color: var(--primary); filter: drop-shadow(0 0 4px rgba(0,212,255,0.3)); }}
-
-            /* --- Stat cards: elevated with subtle inner glow --- */
+            .page-title {{ font-size: 2rem; font-weight: bold; margin-bottom: 1.5rem; color: var(--gray-900); }}
+            .alert {{ padding: 1rem; border-radius: 0.5rem; margin-bottom: 1rem; display: flex; gap: 0.75rem; align-items: flex-start; }}
+            .alert-success {{ background: rgba(16, 185, 129, 0.1); border: 1px solid var(--success); color: var(--success); }}
+            .alert-error {{ background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }}
+            .card {{ background: white; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 1.5rem; margin-bottom: 1.5rem; }}
+            .card-title {{ font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }}
+            .card-title i {{ color: var(--primary); }}
             .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }}
-            .stat-card {{ background: linear-gradient(145deg, var(--surface-2), var(--surface-3)); border: 1px solid var(--glass-border); border-radius: 0.75rem; padding: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.04); text-align: center; transition: transform 0.3s ease, box-shadow 0.3s ease; }}
-            .stat-card:hover {{ transform: translateY(-2px); box-shadow: 0 8px 30px rgba(0,0,0,0.35), 0 0 20px rgba(0,212,255,0.06); }}
-            .stat-value {{ font-size: 2rem; font-weight: bold; color: var(--primary); margin: 0.5rem 0; text-shadow: 0 0 20px rgba(0,212,255,0.2); }}
-            .stat-label {{ color: var(--text-secondary); font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; }}
-            .stat-icon {{ font-size: 2rem; color: var(--primary); margin-bottom: 0.5rem; opacity: 0.7; filter: drop-shadow(0 0 6px rgba(0,212,255,0.3)); }}
-
-            /* --- Tables: dark rows with cyan accent lines --- */
+            .stat-card {{ background: white; border-radius: 0.5rem; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); text-align: center; }}
+            .stat-value {{ font-size: 2rem; font-weight: bold; color: var(--primary); margin: 0.5rem 0; }}
+            .stat-label {{ color: var(--gray-500); font-size: 0.875rem; }}
+            .stat-icon {{ font-size: 2rem; color: var(--primary); margin-bottom: 0.5rem; opacity: 0.7; }}
             table {{ width: 100%; border-collapse: collapse; margin-bottom: 1rem; }}
-            thead {{ background: rgba(0, 212, 255, 0.04); border-bottom: 2px solid rgba(0,212,255,0.15); }}
-            th {{ padding: 0.75rem; text-align: left; font-weight: 600; color: var(--text-secondary); font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.04em; }}
-            td {{ padding: 0.75rem; border-bottom: 1px solid var(--border); color: var(--text-primary); }}
-            tbody tr {{ transition: background 0.2s ease; }}
-            tbody tr:hover {{ background: rgba(0, 212, 255, 0.04); }}
-
-            /* --- Buttons: gradient fills with glow on hover --- */
-            .btn {{ padding: 0.5rem 1rem; border: none; border-radius: 0.5rem; font-size: 0.875rem; font-weight: 500; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem; transition: all 0.3s ease; }}
-            .btn-primary {{ background: linear-gradient(135deg, var(--primary), #0099cc); color: #0a0e1a; font-weight: 600; }}
-            .btn-primary:hover {{ box-shadow: 0 0 20px rgba(0,212,255,0.3); transform: translateY(-1px); }}
-            .btn-success {{ background: linear-gradient(135deg, var(--success), #00b36b); color: #0a0e1a; font-weight: 600; }}
-            .btn-success:hover {{ box-shadow: 0 0 20px rgba(0,230,138,0.3); transform: translateY(-1px); }}
-            .btn-danger {{ background: linear-gradient(135deg, var(--danger), #cc2244); color: white; }}
-            .btn-danger:hover {{ box-shadow: 0 0 20px rgba(255,77,106,0.3); transform: translateY(-1px); }}
+            thead {{ background: var(--gray-100); border-bottom: 2px solid var(--gray-200); }}
+            th {{ padding: 0.75rem; text-align: left; font-weight: 600; color: var(--gray-700); font-size: 0.875rem; }}
+            td {{ padding: 0.75rem; border-bottom: 1px solid var(--gray-200); }}
+            tbody tr:hover {{ background: var(--gray-50); }}
+            .btn {{ padding: 0.5rem 1rem; border: none; border-radius: 0.375rem; font-size: 0.875rem; font-weight: 500; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem; transition: all 0.2s; }}
+            .btn-primary {{ background: var(--primary); color: white; }}
+            .btn-primary:hover {{ background: var(--primary-dark); }}
+            .btn-success {{ background: var(--success); color: white; }}
+            .btn-success:hover {{ background: #059669; }}
+            .btn-danger {{ background: var(--danger); color: white; }}
+            .btn-danger:hover {{ background: #dc2626; }}
             .btn-small {{ padding: 0.25rem 0.75rem; font-size: 0.75rem; }}
-
-            /* --- Forms: dark inputs with glow focus --- */
             .form-group {{ margin-bottom: 1.5rem; }}
-            label {{ display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--text-secondary); }}
-            input[type="text"], input[type="email"], input[type="password"], input[type="number"], select, textarea {{ width: 100%; padding: 0.625rem 0.75rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 0.5rem; font-size: 0.875rem; font-family: inherit; background: var(--surface-1); color: var(--text-primary); transition: all 0.3s ease; }}
-            input:focus, select:focus, textarea:focus {{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,212,255,0.1), 0 0 15px rgba(0,212,255,0.05); background: var(--surface-2); }}
-            input::placeholder, textarea::placeholder {{ color: var(--text-muted); }}
-
-            /* --- Status badges: glowing pill indicators --- */
-            .status-badge {{ display: inline-block; padding: 0.25rem 0.75rem; border-radius: 1rem; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }}
-            .status-pending {{ background: rgba(255, 77, 106, 0.12); color: var(--danger); border: 1px solid rgba(255,77,106,0.2); }}
-            .status-code_assigned {{ background: rgba(255, 176, 32, 0.12); color: var(--warning); border: 1px solid rgba(255,176,32,0.2); }}
-            .status-emailed {{ background: rgba(0, 212, 255, 0.12); color: var(--primary); border: 1px solid rgba(0,212,255,0.2); }}
-            .status-opened {{ background: rgba(0, 230, 138, 0.12); color: var(--success); border: 1px solid rgba(0,230,138,0.2); }}
-            .status-completed {{ background: rgba(0, 230, 138, 0.12); color: var(--success); border: 1px solid rgba(0,230,138,0.2); }}
-            .status-email_failed {{ background: rgba(255, 77, 106, 0.15); color: var(--danger); border: 1px solid rgba(255,77,106,0.3); animation: pulse-fail 2s ease-in-out infinite; }}
-            @keyframes pulse-fail {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.6; }} }}
-
-            /* --- Email status dots with glow --- */
+            label {{ display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--gray-700); }}
+            input[type="text"], input[type="email"], input[type="password"], input[type="number"], select, textarea {{ width: 100%; padding: 0.5rem; border: 1px solid var(--gray-300); border-radius: 0.375rem; font-size: 0.875rem; font-family: inherit; }}
+            input:focus, select:focus, textarea:focus {{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }}
+            .status-badge {{ display: inline-block; padding: 0.25rem 0.75rem; border-radius: 1rem; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }}
+            .status-pending {{ background: rgba(239, 68, 68, 0.1); color: var(--danger); }}
+            .status-code_assigned {{ background: rgba(245, 158, 11, 0.1); color: var(--warning); }}
+            .status-emailed {{ background: rgba(59, 130, 246, 0.1); color: var(--primary); }}
+            .status-opened {{ background: rgba(16, 185, 129, 0.1); color: var(--success); }}
+            .status-completed {{ background: rgba(16, 185, 129, 0.1); color: var(--success); }}
+            .status-email_failed {{ background: rgba(220, 38, 38, 0.15); color: #dc2626; border: 1px solid rgba(220, 38, 38, 0.3); animation: pulse-fail 2s ease-in-out infinite; }}
+            @keyframes pulse-fail {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} }}
             .email-status {{ display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 0.25rem; }}
-            .email-status-opened {{ background: var(--success); box-shadow: 0 0 6px rgba(0,230,138,0.4); }}
-            .email-status-not-opened {{ background: var(--danger); box-shadow: 0 0 6px rgba(255,77,106,0.4); }}
-            .email-status-unsent {{ background: var(--text-muted); }}
-
+            .email-status-opened {{ background: var(--success); }}
+            .email-status-not-opened {{ background: var(--danger); }}
+            .email-status-unsent {{ background: var(--gray-300); }}
             .es {{ text-align: center; padding: 3rem; }}
-            .es i {{ font-size: 4rem; color: var(--text-muted); margin-bottom: 1rem; }}
-            .es h3 {{ color: var(--text-secondary); }}
+            .es i {{ font-size: 4rem; color: var(--gray-300); margin-bottom: 1rem; }}
+            .es h3 {{ color: var(--gray-500); }}
             .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }}
-
-            /* --- Code elements: monospace with subtle highlight --- */
-            code {{ background: rgba(0,212,255,0.06); border: 1px solid rgba(0,212,255,0.1); border-radius: 0.25rem; padding: 0.1rem 0.4rem; font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace; color: var(--accent-teal); }}
-
-            /* --- Links --- */
-            a {{ color: var(--primary); transition: color 0.2s ease; }}
-            a:hover {{ color: var(--accent-teal); }}
-
-            /* --- Scrollbar: thin dark with cyan thumb --- */
-            ::-webkit-scrollbar {{ width: 6px; }}
-            ::-webkit-scrollbar-track {{ background: var(--surface-0); }}
-            ::-webkit-scrollbar-thumb {{ background: rgba(0,212,255,0.2); border-radius: 3px; }}
-            ::-webkit-scrollbar-thumb:hover {{ background: rgba(0,212,255,0.35); }}
-
-            /* --- Subtle ambient glow animation on sidebar brand icon --- */
-            @keyframes glow-pulse {{ 0%, 100% {{ filter: drop-shadow(0 0 6px rgba(0,212,255,0.5)); }} 50% {{ filter: drop-shadow(0 0 12px rgba(0,212,255,0.8)); }} }}
-            .sidebar-brand i {{ animation: glow-pulse 3s ease-in-out infinite; }}
-
-            /* --- Responsive --- */
             @media (max-width: 768px) {{
                 .container {{ flex-direction: column; }}
                 .sidebar {{ width: 100%; padding: 1rem 0; }}
@@ -1574,6 +2831,7 @@ def render_page(title, content, active="", user=None):
                     <li><a href="/applicants" class="{'active' if active == 'applicants' else ''}"><i class="fas fa-users"></i> Applicants</a></li>
                     <li><a href="/clients" class="{'active' if active == 'clients' else ''}"><i class="fas fa-building"></i> Clients</a></li>
                     <li><a href="/codes" class="{'active' if active == 'codes' else ''}"><i class="fas fa-barcode"></i> Codes</a></li>
+                    <li><a href="/laps" class="{'active' if active == 'laps' else ''}"><i class="fas fa-search-plus"></i> LAPS</a></li>
                     <li><a href="/settings" class="{'active' if active == 'settings' else ''}"><i class="fas fa-cog"></i> Settings</a></li>
                     <li><a href="/logs" class="{'active' if active == 'logs' else ''}"><i class="fas fa-file-alt"></i> Logs</a></li>
                     {'<li><a href="/users" class="' + ("active" if active == "users" else "") + '"><i class="fas fa-users-cog"></i> Users</a></li>' if user and user.get("role") == "admin" else ""}
@@ -1613,24 +2871,21 @@ def page_login(error=""):
         <title>Login - Fingerprint Release Manager</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
         <style>
-            @keyframes glow-pulse {{ 0%, 100% {{ filter: drop-shadow(0 0 8px rgba(0, 212, 255, 0.6)); }} 50% {{ filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.9)); }} }}
-            @keyframes float-in {{ from {{ opacity: 0; transform: translateY(20px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-            :root {{ --primary: #00d4ff; --accent-purple: #a855f7; --surface-0: #0a0e1a; --surface-1: rgba(15, 23, 42, 0.85); --text-primary: #e2e8f0; --text-muted: #64748b; }}
+            :root {{ --primary: #2563eb; --gray-50: #f9fafb; --gray-200: #e5e7eb; --gray-400: #9ca3af; --gray-700: #374151; --gray-900: #111827; }}
             * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--surface-0); background-image: radial-gradient(ellipse at 20% 50%, rgba(0, 212, 255, 0.08) 0%, transparent 50%), radial-gradient(ellipse at 80% 50%, rgba(168, 85, 247, 0.06) 0%, transparent 50%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
-            .login-card {{ background: var(--surface-1); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(0, 212, 255, 0.15); border-radius: 1rem; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5), 0 0 60px rgba(0, 212, 255, 0.05); padding: 3rem; width: 100%; max-width: 420px; animation: float-in 0.6s ease-out; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(135deg, var(--primary) 0%, #1e40af 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+            .login-card {{ background: white; border-radius: 0.5rem; box-shadow: 0 10px 25px rgba(0,0,0,0.2); padding: 3rem; width: 100%; max-width: 400px; }}
             .login-brand {{ text-align: center; margin-bottom: 2rem; }}
-            .login-brand i {{ font-size: 3rem; background: linear-gradient(135deg, var(--primary), var(--accent-purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 0.5rem; animation: glow-pulse 3s ease-in-out infinite; }}
-            .login-brand h1 {{ font-size: 1.5rem; color: var(--text-primary); margin: 0; font-weight: 600; }}
-            .login-brand p {{ color: var(--text-muted); margin: 0.5rem 0 0 0; font-size: 0.875rem; letter-spacing: 0.05em; }}
+            .login-brand i {{ font-size: 3rem; color: var(--primary); margin-bottom: 0.5rem; }}
+            .login-brand h1 {{ font-size: 1.5rem; color: var(--gray-900); margin: 0; }}
+            .login-brand p {{ color: var(--gray-400); margin: 0.5rem 0 0 0; font-size: 0.875rem; }}
             .form-group {{ margin-bottom: 1.5rem; }}
-            label {{ display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--text-primary); font-size: 0.875rem; }}
-            input {{ width: 100%; padding: 0.75rem 1rem; border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 0.5rem; font-size: 0.875rem; font-family: inherit; background: rgba(0, 0, 0, 0.3); color: var(--text-primary); transition: all 0.3s ease; }}
-            input:focus {{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.15), 0 0 20px rgba(0, 212, 255, 0.1); }}
-            input::placeholder {{ color: var(--text-muted); }}
-            .btn {{ width: 100%; padding: 0.75rem; background: linear-gradient(135deg, var(--primary), var(--accent-purple)); color: white; border: none; border-radius: 0.5rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; transition: all 0.3s ease; letter-spacing: 0.03em; }}
-            .btn:hover {{ box-shadow: 0 0 25px rgba(0, 212, 255, 0.3), 0 0 50px rgba(168, 85, 247, 0.15); transform: translateY(-1px); }}
-            .alert {{ background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; padding: 0.75rem; border-radius: 0.5rem; margin-bottom: 1.5rem; font-size: 0.875rem; }}
+            label {{ display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--gray-700); }}
+            input {{ width: 100%; padding: 0.75rem; border: 1px solid var(--gray-200); border-radius: 0.375rem; font-size: 0.875rem; font-family: inherit; }}
+            input:focus {{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }}
+            .btn {{ width: 100%; padding: 0.75rem; background: var(--primary); color: white; border: none; border-radius: 0.375rem; font-size: 0.875rem; font-weight: 500; cursor: pointer; transition: background 0.2s; }}
+            .btn:hover {{ background: #1e40af; }}
+            .alert {{ background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; color: #ef4444; padding: 0.75rem; border-radius: 0.375rem; margin-bottom: 1.5rem; font-size: 0.875rem; }}
         </style>
     </head>
     <body>
@@ -1638,7 +2893,7 @@ def page_login(error=""):
             <div class="login-brand">
                 <i class="fas fa-fingerprint"></i>
                 <h1>Fingerprint Release</h1>
-                <p>Manager v3.0</p>
+                <p>Manager v2.0</p>
             </div>
             {error_html}
             <form method="POST" action="/login">
@@ -1653,7 +2908,7 @@ def page_login(error=""):
                 <button type="submit" class="btn">Sign In</button>
             </form>
             <p style="text-align:center;margin-top:1.25rem;font-size:.875rem;">
-                <a href="/forgot-password" style="color:var(--primary);text-decoration:none;transition:color 0.2s;">Forgot password?</a>
+                <a href="/forgot-password" style="color:var(--primary);text-decoration:none;">Forgot password?</a>
             </p>
         </div>
     </body>
@@ -2215,35 +3470,28 @@ This link is valid for <strong>2 hours</strong>.</p>
 
 
 def page_forgot_password(error="", success=""):
-    error_html = f'<div class="alert alert-error">{h(error)}</div>' if error else ""
-    success_html = f'<div class="alert alert-success">{h(success)}</div>' if success else ""
+    error_html = f'<div class="alert" style="background:rgba(239,68,68,0.1);border:1px solid #ef4444;color:#ef4444;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(error)}</div>' if error else ""
+    success_html = f'<div class="alert" style="background:rgba(16,185,129,0.1);border:1px solid #10b981;color:#10b981;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(success)}</div>' if success else ""
     return f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Forgot Password – Fingerprint Release Manager</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
-@keyframes glow-pulse{{0%,100%{{filter:drop-shadow(0 0 8px rgba(0,212,255,0.6));}}50%{{filter:drop-shadow(0 0 20px rgba(0,212,255,0.9));}}}}
-@keyframes float-in{{from{{opacity:0;transform:translateY(20px);}}to{{opacity:1;transform:translateY(0);}}}}
-:root{{--primary:#00d4ff;--accent-purple:#a855f7;--surface-0:#0a0e1a;--surface-1:rgba(15,23,42,0.85);--text-primary:#e2e8f0;--text-muted:#64748b;}}
+:root{{--primary:#2563eb;--gray-50:#f9fafb;--gray-200:#e5e7eb;--gray-400:#9ca3af;--gray-700:#374151;--gray-900:#111827;}}
 *{{margin:0;padding:0;box-sizing:border-box;}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--surface-0);background-image:radial-gradient(ellipse at 20% 50%,rgba(0,212,255,0.08) 0%,transparent 50%),radial-gradient(ellipse at 80% 50%,rgba(168,85,247,0.06) 0%,transparent 50%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
-.card{{background:var(--surface-1);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border:1px solid rgba(0,212,255,0.15);border-radius:1rem;box-shadow:0 10px 40px rgba(0,0,0,0.5),0 0 60px rgba(0,212,255,0.05);padding:3rem;width:100%;max-width:420px;animation:float-in 0.6s ease-out;}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,var(--primary) 0%,#1e40af 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
+.card{{background:white;border-radius:.5rem;box-shadow:0 10px 25px rgba(0,0,0,.2);padding:3rem;width:100%;max-width:400px;}}
 .brand{{text-align:center;margin-bottom:2rem;}}
-.brand i{{font-size:3rem;background:linear-gradient(135deg,var(--primary),var(--accent-purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:.5rem;animation:glow-pulse 3s ease-in-out infinite;}}
-.brand h1{{font-size:1.5rem;color:var(--text-primary);margin:0;font-weight:600;}}
-.brand p{{color:var(--text-muted);margin:.5rem 0 0;font-size:.875rem;letter-spacing:0.05em;}}
+.brand i{{font-size:3rem;color:var(--primary);margin-bottom:.5rem;}}
+.brand h1{{font-size:1.5rem;color:var(--gray-900);margin:0;}}
+.brand p{{color:var(--gray-400);margin:.5rem 0 0;font-size:.875rem;}}
 .fg{{margin-bottom:1.5rem;}}
-label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--text-primary);font-size:.875rem;}}
-input{{width:100%;padding:.75rem 1rem;border:1px solid rgba(0,212,255,0.2);border-radius:.5rem;font-size:.875rem;font-family:inherit;background:rgba(0,0,0,0.3);color:var(--text-primary);transition:all 0.3s ease;}}
-input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(0,212,255,0.15),0 0 20px rgba(0,212,255,0.1);}}
-input::placeholder{{color:var(--text-muted);}}
-.btn{{width:100%;padding:.75rem;background:linear-gradient(135deg,var(--primary),var(--accent-purple));color:white;border:none;border-radius:.5rem;font-size:.875rem;font-weight:600;cursor:pointer;transition:all 0.3s ease;letter-spacing:0.03em;}}
-.btn:hover{{box-shadow:0 0 25px rgba(0,212,255,0.3),0 0 50px rgba(168,85,247,0.15);transform:translateY(-1px);}}
-.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;transition:color 0.2s;}}
-.back:hover{{color:#a855f7;}}
-.alert{{padding:.75rem;border-radius:.5rem;margin-bottom:1.5rem;font-size:.875rem;}}
-.alert-error{{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);color:#f87171;}}
-.alert-success{{background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.4);color:#34d399;}}
+label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--gray-700);}}
+input{{width:100%;padding:.75rem;border:1px solid var(--gray-200);border-radius:.375rem;font-size:.875rem;font-family:inherit;}}
+input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1);}}
+.btn{{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.375rem;font-size:.875rem;font-weight:500;cursor:pointer;transition:background .2s;}}
+.btn:hover{{background:#1e40af;}}
+.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;}}
 </style></head><body>
 <div class="card">
   <div class="brand"><i class="fas fa-fingerprint"></i><h1>Forgot Password</h1><p>Enter your username or recovery email</p></div>
@@ -2254,31 +3502,27 @@ input::placeholder{{color:var(--text-muted);}}
 
 
 def page_reset_password(token, error=""):
-    error_html = f'<div class="alert" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:.75rem;border-radius:.5rem;margin-bottom:1.5rem;font-size:.875rem;">{h(error)}</div>' if error else ""
+    error_html = f'<div class="alert" style="background:rgba(239,68,68,0.1);border:1px solid #ef4444;color:#ef4444;padding:.75rem;border-radius:.375rem;margin-bottom:1.5rem;font-size:.875rem;">{h(error)}</div>' if error else ""
     return f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Reset Password – Fingerprint Release Manager</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
-@keyframes glow-pulse{{0%,100%{{filter:drop-shadow(0 0 8px rgba(0,212,255,0.6));}}50%{{filter:drop-shadow(0 0 20px rgba(0,212,255,0.9));}}}}
-@keyframes float-in{{from{{opacity:0;transform:translateY(20px);}}to{{opacity:1;transform:translateY(0);}}}}
-:root{{--primary:#00d4ff;--accent-purple:#a855f7;--surface-0:#0a0e1a;--surface-1:rgba(15,23,42,0.85);--text-primary:#e2e8f0;--text-muted:#64748b;}}
+:root{{--primary:#2563eb;--gray-50:#f9fafb;--gray-200:#e5e7eb;--gray-400:#9ca3af;--gray-700:#374151;--gray-900:#111827;}}
 *{{margin:0;padding:0;box-sizing:border-box;}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--surface-0);background-image:radial-gradient(ellipse at 20% 50%,rgba(0,212,255,0.08) 0%,transparent 50%),radial-gradient(ellipse at 80% 50%,rgba(168,85,247,0.06) 0%,transparent 50%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
-.card{{background:var(--surface-1);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border:1px solid rgba(0,212,255,0.15);border-radius:1rem;box-shadow:0 10px 40px rgba(0,0,0,0.5),0 0 60px rgba(0,212,255,0.05);padding:3rem;width:100%;max-width:420px;animation:float-in 0.6s ease-out;}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,var(--primary) 0%,#1e40af 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;}}
+.card{{background:white;border-radius:.5rem;box-shadow:0 10px 25px rgba(0,0,0,.2);padding:3rem;width:100%;max-width:400px;}}
 .brand{{text-align:center;margin-bottom:2rem;}}
-.brand i{{font-size:3rem;background:linear-gradient(135deg,var(--primary),var(--accent-purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:.5rem;animation:glow-pulse 3s ease-in-out infinite;}}
-.brand h1{{font-size:1.5rem;color:var(--text-primary);margin:0;font-weight:600;}}
+.brand i{{font-size:3rem;color:var(--primary);margin-bottom:.5rem;}}
+.brand h1{{font-size:1.5rem;color:var(--gray-900);margin:0;}}
 .fg{{margin-bottom:1.5rem;}}
-label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--text-primary);font-size:.875rem;}}
-input{{width:100%;padding:.75rem 1rem;border:1px solid rgba(0,212,255,0.2);border-radius:.5rem;font-size:.875rem;font-family:inherit;background:rgba(0,0,0,0.3);color:var(--text-primary);transition:all 0.3s ease;}}
-input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(0,212,255,0.15),0 0 20px rgba(0,212,255,0.1);}}
-input::placeholder{{color:var(--text-muted);}}
-.btn{{width:100%;padding:.75rem;background:linear-gradient(135deg,var(--primary),var(--accent-purple));color:white;border:none;border-radius:.5rem;font-size:.875rem;font-weight:600;cursor:pointer;transition:all 0.3s ease;letter-spacing:0.03em;}}
-.btn:hover{{box-shadow:0 0 25px rgba(0,212,255,0.3),0 0 50px rgba(168,85,247,0.15);transform:translateY(-1px);}}
-.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;transition:color 0.2s;}}
-.back:hover{{color:#a855f7;}}
-.hint{{color:var(--text-muted);font-size:.8rem;margin-top:.25rem;}}
+label{{display:block;margin-bottom:.5rem;font-weight:500;color:var(--gray-700);}}
+input{{width:100%;padding:.75rem;border:1px solid var(--gray-200);border-radius:.375rem;font-size:.875rem;font-family:inherit;}}
+input:focus{{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1);}}
+.btn{{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.375rem;font-size:.875rem;font-weight:500;cursor:pointer;}}
+.btn:hover{{background:#1e40af;}}
+.back{{display:block;text-align:center;margin-top:1rem;color:var(--primary);font-size:.875rem;text-decoration:none;}}
+.hint{{color:#6b7280;font-size:.8rem;margin-top:.25rem;}}
 </style></head><body>
 <div class="card">
   <div class="brand"><i class="fas fa-key"></i><h1>Set New Password</h1></div>
@@ -2561,6 +3805,9 @@ class Handler(BaseHTTPRequestHandler):
                 </div>
                 """
                 self._send(200, render_page("Add Codes Manually", content, active="codes", user=user))
+
+            elif path == "/laps":
+                self._send(200, page_laps_dashboard(db, nav_user=user))
 
             elif path == "/settings":
                 self._send(200, page_settings(db, nav_user=user))
@@ -3435,6 +4682,15 @@ class Handler(BaseHTTPRequestHandler):
                         flash(f"User '{target['username']}' deleted.", "success")
                     self._redirect("/users")
 
+            elif path == "/laps/trigger":
+                user = self._check_auth()
+                if not user:
+                    self._redirect("/login")
+                    return
+                trigger_laps_cycle_manual()
+                flash("LAPS retrieval cycle triggered! Check back in a few minutes.", "success")
+                self._redirect("/laps")
+
             else:
                 self._send(404, render_page("Not Found",
                     '<div class="es"><i class="fas fa-exclamation-triangle"></i><h3>Page not found</h3></div>'))
@@ -3449,9 +4705,11 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     init_db()
     start_folder_watcher()
+    start_laps_worker()
     print(f"""
     ╔══════════════════════════════════════════════════════════╗
-    ║   Fingerprint Release Manager v2.0                       ║
+    ║   Fingerprint Release Manager v4.0                       ║
+    ║   (LAPS Retriever)                                       ║
     ║   Web UI:      http://localhost:{PORT}                     ║
     ║                                                          ║
     ║   LOGIN:                                                 ║
@@ -3462,6 +4720,8 @@ if __name__ == "__main__":
     ║   Drop .xlsx/.csv files into the 'watch/' folder         ║
     ║   and codes will be imported automatically!              ║
     ║   Watch folder: {WATCH_FOLDER:<40s}  ║
+    ║                                                          ║
+    ║   LAPS:    Hourly auto-retrieval (if configured)         ║
     ║                                                          ║
     ║   API ENDPOINTS:                                         ║
     ║   POST /api/accio-push     (Accio Data XML results)      ║
