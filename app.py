@@ -1647,35 +1647,37 @@ class LAPSDB:
         finally:
             db.close()
 
-    def find_matching_applicant(self, last_name, first_name, last_four_ssn):
-        """Match a LAPS rap sheet subject to an FP Release applicant."""
+    def find_matching_applicant(self, last_name, first_name):
+        """
+        Match a LAPS rap sheet subject to an FP Release applicant.
+
+        SECURITY: Matching uses NAME ONLY from LAPS. The SSN last 4 and DOB
+        stored in the FP Release DB (from the original Accio XML push) are used
+        as verification — NO SSN data is extracted from or transmitted through LAPS.
+
+        Strategy:
+          1. Match on last_name + first_name (case-insensitive)
+          2. Prefer applicants that have SSN/DOB on file (stronger identity)
+          3. Return most recent matching applicant (by email_sent_at)
+          4. Only match applicants that haven't been processed yet (laps_status IS NULL)
+        """
         if not last_name or not first_name:
             return None
         db = get_db()
         try:
-            if last_four_ssn:
-                cur = db.execute("""
-                    SELECT id, first_name, last_name, last_four_ssn,
-                           accio_order_number, accio_sub_order, email_sent_at, created_at
-                    FROM applicants
-                    WHERE LOWER(TRIM(last_name)) = LOWER(TRIM(%s))
-                      AND LOWER(TRIM(first_name)) = LOWER(TRIM(%s))
-                      AND last_four_ssn = %s
-                      AND email_sent = TRUE AND laps_status IS NULL
-                    ORDER BY email_sent_at DESC NULLS LAST, created_at DESC
-                    LIMIT 1
-                """, (last_name, first_name, last_four_ssn))
-            else:
-                cur = db.execute("""
-                    SELECT id, first_name, last_name, last_four_ssn,
-                           accio_order_number, accio_sub_order, email_sent_at, created_at
-                    FROM applicants
-                    WHERE LOWER(TRIM(last_name)) = LOWER(TRIM(%s))
-                      AND LOWER(TRIM(first_name)) = LOWER(TRIM(%s))
-                      AND email_sent = TRUE AND laps_status IS NULL
-                    ORDER BY email_sent_at DESC NULLS LAST, created_at DESC
-                    LIMIT 1
-                """, (last_name, first_name))
+            # Name-based match — prefer applicants with SSN/DOB on file for stronger identity
+            cur = db.execute("""
+                SELECT id, first_name, last_name, last_four_ssn, date_of_birth,
+                       accio_order_number, accio_sub_order, email_sent_at, created_at
+                FROM applicants
+                WHERE LOWER(TRIM(last_name)) = LOWER(TRIM(%s))
+                  AND LOWER(TRIM(first_name)) = LOWER(TRIM(%s))
+                  AND email_sent = TRUE AND laps_status IS NULL
+                ORDER BY
+                    CASE WHEN last_four_ssn IS NOT NULL AND last_four_ssn != '' THEN 0 ELSE 1 END,
+                    email_sent_at DESC NULLS LAST, created_at DESC
+                LIMIT 1
+            """, (last_name, first_name))
             row = cur.fetchone()
             if not row:
                 return None
@@ -2345,7 +2347,8 @@ class LAPSRetriever:
                     laps_logger.info("Parsed: status=%s, arrests=%d", rap_sheet.status.value, len(rap_sheet.records))
 
                     first_name, last_name = _parse_laps_name(rap_sheet.subject_name or laps_name)
-                    applicant = self.laps_db.find_matching_applicant(last_name, first_name, rap_sheet.subject_ssn_last4)
+                    # SECURITY: Match by name only — SSN/DOB from Accio DB, never from LAPS
+                    applicant = self.laps_db.find_matching_applicant(last_name, first_name)
 
                     if not applicant:
                         laps_logger.info("No matching FP Release applicant found")
