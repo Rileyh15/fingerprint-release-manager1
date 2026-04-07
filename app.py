@@ -140,8 +140,7 @@ LAPS_TOKEN_GRID = {
 # Accio PostResults config for LAPS results
 ACCIO_API_BASE_URL = os.environ.get("ACCIO_API_BASE_URL", "")
 ACCIO_API_ACCOUNT = os.environ.get("ACCIO_API_ACCOUNT", "")
-ACCIO_API_USERNAME_LAPS = os.environ.get("ACCIO_API_USERNAME", "")
-ACCIO_API_PASSWORD_LAPS = os.environ.get("ACCIO_API_PASSWORD", "")
+# LAPS pusher reuses the same vendor credentials (ACCIO_API_USERNAME / ACCIO_API_PASSWORD)
 ACCIO_API_MODE = os.environ.get("ACCIO_API_MODE", "PROD")
 ACCIO_REGISTRATION_KEY = os.environ.get("ACCIO_REGISTRATION_KEY", "")
 ACCIO_REGISTRATION_COMPANY = os.environ.get("ACCIO_REGISTRATION_COMPANY", "Background Research Solutions, LLC")
@@ -2147,14 +2146,16 @@ class AccioLAPSPusher:
     SEARCH_TYPE = "Fingerprint Criminal History"
 
     def __init__(self):
-        self._base_url = ACCIO_API_BASE_URL.rstrip("/")
+        settings = get_settings()
+        self._base_url = settings.get("accio_researcher_url", "").rstrip("/") or ACCIO_API_BASE_URL.rstrip("/")
 
     def _build_login_xml(self):
+        settings = get_settings()
         return (
             "<login>"
-            f"<account>{_laps_xml_escape(ACCIO_API_ACCOUNT)}</account>"
-            f"<username>{_laps_xml_escape(ACCIO_API_USERNAME_LAPS)}</username>"
-            f"<password>{_laps_xml_escape(ACCIO_API_PASSWORD_LAPS)}</password>"
+            f"<account>{_laps_xml_escape(settings.get('accio_account',''))}</account>"
+            f"<username>{_laps_xml_escape(settings.get('accio_username',''))}</username>"
+            f"<password>{_laps_xml_escape(settings.get('accio_password',''))}</password>"
             "</login>"
         )
 
