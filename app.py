@@ -3396,11 +3396,21 @@ def page_clients(db, params, nav_user=None):
             <p><strong>Total Applicants:</strong> {len(applicants)}</p>
         </div>
         <div class="card"><div class="card-title">Applicants</div>
-            <table><thead><tr><th>Order #</th><th>Name</th><th>Email</th><th>Status</th><th>Code</th></tr></thead><tbody>
+            <table><thead><tr><th>Order #</th><th>Name</th><th>Email</th><th>Received</th><th>Email Sent</th><th>Status</th><th>Code</th><th>Actions</th></tr></thead><tbody>
         """
         for a in applicants:
             safe_st = h(a['status']).replace(" ", "_")
-            content += f"<tr><td><code style='font-size:0.8rem;'>{h(a['accio_order_number'] or '-')}</code></td><td>{h(a['first_name'])} {h(a['last_name'])}</td><td>{h(a['email'] or '-')}</td><td><span class=\"status-badge status-{safe_st}\">{h(a['status'])}</span></td><td><code>{h(a['assigned_code'] or '-')}</code></td></tr>"
+            received_dt = fmt_dt(a.get('created_at'))
+            sent_dt = fmt_dt(a.get('email_sent_at')) if a.get('email_sent_at') else '-'
+            resend_btn = ""
+            if a.get('email') and a.get('assigned_code'):
+                resend_btn = (
+                    f'<form method="POST" action="/applicants/{a["id"]}/resend" style="display:inline;">'
+                    f'<input type="hidden" name="redirect" value="/clients?client_id={client_id}">'
+                    f'<button type="submit" class="btn btn-small" style="background:#17a2b8; color:white;" title="Resend email with CC to client">'
+                    f'<i class="fas fa-redo"></i> Resend</button></form>'
+                )
+            content += f"<tr><td><code style='font-size:0.8rem;'>{h(a['accio_order_number'] or '-')}</code></td><td>{h(a['first_name'])} {h(a['last_name'])}</td><td>{h(a['email'] or '-')}</td><td>{received_dt}</td><td>{sent_dt}</td><td><span class=\"status-badge status-{safe_st}\">{h(a['status'])}</span></td><td><code>{h(a['assigned_code'] or '-')}</code></td><td>{resend_btn}</td></tr>"
         content += "</tbody></table></div>"
     else:
         clients = db.execute("""
@@ -4361,6 +4371,7 @@ class Handler(BaseHTTPRequestHandler):
 
             elif path.startswith("/applicants/") and path.endswith("/resend"):
                 aid = int(path.split("/")[2])
+                redirect_to = fv("redirect") or "/applicants"
                 a = db.execute("SELECT * FROM applicants WHERE id = %s", (aid,)).fetchone()
                 if not a:
                     flash("Applicant not found.", "error")
@@ -4380,7 +4391,7 @@ class Handler(BaseHTTPRequestHandler):
                             sms_note = f" (SMS error: {sms_err})"
                     flash((f"Email resent to {a['email']}!" + sms_note) if ok else f"Resend failed: {msg}",
                           "success" if ok else "error")
-                self._redirect("/applicants")
+                self._redirect(redirect_to)
 
             elif path.startswith("/applicants/") and path.endswith("/mark-complete"):
                 aid = int(path.split("/")[2])
