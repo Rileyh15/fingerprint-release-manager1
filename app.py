@@ -2156,16 +2156,16 @@ class AccioLAPSPusher:
     SEARCH_TYPE = "Fingerprint Criminal History"
 
     def __init__(self):
-        settings = get_settings()
-        self._base_url = settings.get("accio_researcher_url", "").rstrip("/") or ACCIO_API_BASE_URL.rstrip("/")
+        db = get_db()
+        self._base_url = (get_setting(db, "accio_researcher_url") or "").rstrip("/") or ACCIO_API_BASE_URL.rstrip("/")
 
     def _build_login_xml(self):
-        settings = get_settings()
+        db = get_db()
         return (
             "<login>"
-            f"<account>{_laps_xml_escape(settings.get('accio_account',''))}</account>"
-            f"<username>{_laps_xml_escape(settings.get('accio_username',''))}</username>"
-            f"<password>{_laps_xml_escape(settings.get('accio_password',''))}</password>"
+            f"<account>{_laps_xml_escape(get_setting(db, 'accio_account'))}</account>"
+            f"<username>{_laps_xml_escape(get_setting(db, 'accio_username'))}</username>"
+            f"<password>{_laps_xml_escape(get_setting(db, 'accio_password'))}</password>"
             "</login>"
         )
 
