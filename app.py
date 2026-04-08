@@ -998,6 +998,13 @@ def send_release_email(db, applicant_id):
     if not smtp_server or not sender_email:
         return False, "SMTP not configured. Go to Settings."
 
+    # Look up client email so we can CC them on the applicant notification
+    client_email = None
+    if a.get("client_id"):
+        client_row = db.execute("SELECT contact_email FROM clients WHERE id = %s", (a["client_id"],)).fetchone()
+        if client_row and client_row["contact_email"]:
+            client_email = client_row["contact_email"].strip()
+
     reps = dict(first_name=a["first_name"], last_name=a["last_name"],
                 email=a["email"], code=a["assigned_code"],
                 company_name=get_setting(db, "company_name"),
@@ -1009,6 +1016,8 @@ def send_release_email(db, applicant_id):
     msg = MIMEMultipart("mixed")
     msg["From"] = f"{sender_name} <{sender_email}>"
     msg["To"] = a["email"]
+    if client_email:
+        msg["Cc"] = client_email
     msg["Subject"] = subj
     msg["Reply-To"] = sender_email
     # RFC 5322 required headers — missing these is a major spam signal
@@ -1055,7 +1064,8 @@ This message was sent by {h(company_name)}. If you believe you received this ema
 
     try:
         logger.info(f"SMTP: Connecting to {smtp_server}:{smtp_port} (TLS={use_tls})")
-        logger.info(f"SMTP: From={sender_email}, To={a['email']}, User={smtp_user}")
+        cc_info = f", Cc={client_email}" if client_email else ""
+        logger.info(f"SMTP: From={sender_email}, To={a['email']}{cc_info}, User={smtp_user}")
         srv = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
         srv.set_debuglevel(0)  # Disabled — debuglevel=1 leaks SMTP credentials to logs
         if use_tls:
@@ -3366,12 +3376,22 @@ def page_clients(db, params, nav_user=None):
             (client_id,)
         ).fetchall()
 
+        # Check for success flash from email update
+        email_saved = params.get("email_saved", [None])[0]
+        save_msg = '<div class="flash flash-success" style="margin-bottom:1rem;"><i class="fas fa-check-circle"></i> Client email saved — this client will now be CC\'d on applicant emails.</div>' if email_saved else ""
+
         content = f"""
         <a href="/clients" class="btn" style="background: var(--gray-300); color: var(--gray-900); margin-bottom: 1rem;"><i class="fas fa-arrow-left"></i> Back</a>
+        {save_msg}
         <div class="card">
             <div class="card-title">{h(client['company_name'])}</div>
             <p><strong>Account:</strong> {h(client['account_name'] or '-')}</p>
-            <p><strong>Email:</strong> {h(client['contact_email'] or '-')}</p>
+            <form method="POST" action="/clients/update-email" style="display:flex; align-items:center; gap:0.5rem; margin:0.5rem 0;">
+                <input type="hidden" name="client_id" value="{client['id']}">
+                <strong>Email:</strong>
+                <input type="email" name="contact_email" value="{h(client['contact_email'] or '')}" placeholder="client@example.com" style="padding:6px 10px; border:1px solid var(--gray-300); border-radius:6px; width:280px;">
+                <button type="submit" class="btn btn-primary btn-small"><i class="fas fa-save"></i> Save</button>
+            </form>
             <p><strong>Phone:</strong> {h(client['contact_phone'] or '-')}</p>
             <p><strong>Total Applicants:</strong> {len(applicants)}</p>
         </div>
@@ -3392,7 +3412,8 @@ def page_clients(db, params, nav_user=None):
 
         content = """<div class="card"><table><thead><tr><th>Company</th><th>Account</th><th>Contact Email</th><th>Total Applicants</th><th>Last Order</th><th>Actions</th></tr></thead><tbody>"""
         for c in clients:
-            content += f'<tr><td>{h(c["company_name"])}</td><td>{h(c["account_name"] or "-")}</td><td>{h(c["contact_email"] or "-")}</td><td>{c["app_count"]}</td><td>{fmt_dt(c["last_order"])}</td><td><a href="/clients?client_id={c["id"]}" class="btn btn-primary btn-small">View</a></td></tr>'
+            email_cell = h(c["contact_email"]) if c["contact_email"] else f'<a href="/clients?client_id={c["id"]}" style="color:var(--warning);font-size:0.85rem;"><i class="fas fa-plus-circle"></i> Add</a>'
+            content += f'<tr><td>{h(c["company_name"])}</td><td>{h(c["account_name"] or "-")}</td><td>{email_cell}</td><td>{c["app_count"]}</td><td>{fmt_dt(c["last_order"])}</td><td><a href="/clients?client_id={c["id"]}" class="btn btn-primary btn-small">View</a></td></tr>'
         content += "</tbody></table></div>"
 
     return render_page("Clients", content, active="clients", user=nav_user)
@@ -4464,6 +4485,15 @@ class Handler(BaseHTTPRequestHandler):
                     if os.path.exists(fpath):
                         os.remove(fpath)
                 self._redirect("/codes")
+
+            elif path == "/clients/update-email":
+                cid = fv("client_id")
+                new_email = fv("contact_email").strip()
+                if cid:
+                    db.execute("UPDATE clients SET contact_email = %s WHERE id = %s", (new_email or None, int(cid)))
+                    db.commit()
+                    logger.info("Client %s email updated to: %s", cid, new_email or "(cleared)")
+                self._redirect(f"/clients?client_id={cid}&email_saved=1")
 
             elif path == "/settings":
                 if isinstance(form_data, cgi.FieldStorage):
