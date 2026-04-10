@@ -1577,7 +1577,12 @@ def h(text):
 
 
 def fmt_dt(val):
-    """Format datetime for display."""
+    """Format datetime for display in America/Chicago (Central) time.
+
+    Render servers run in UTC, so all timestamps in the database are UTC.
+    We convert them to Central Time (CST/CDT auto-handled) so the UI shows
+    the correct local time for Louisiana operations.
+    """
     if not val:
         return "-"
     if isinstance(val, str):
@@ -1585,7 +1590,15 @@ def fmt_dt(val):
             val = datetime.fromisoformat(val)
         except Exception:
             return val
-    return val.strftime("%Y-%m-%d %H:%M")
+    # Timestamps from the DB are naive (no tzinfo) but represent UTC.
+    # Attach UTC, then convert to Central.
+    try:
+        if val.tzinfo is None:
+            val = val.replace(tzinfo=ZoneInfo("UTC"))
+        val = val.astimezone(ZoneInfo("America/Chicago"))
+    except Exception:
+        pass
+    return val.strftime("%Y-%m-%d %I:%M %p")
 
 
 # ===========================================================================
