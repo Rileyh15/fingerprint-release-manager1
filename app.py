@@ -404,6 +404,16 @@ def init_db():
         except psycopg2.Error:
             pass  # Column already exists
 
+    # Per-report requester email(s) from Accio orderInfo.
+    # Stored as a comma-separated list so multiple requesters on the same
+    # order can all be CC'd on the applicant notification.  Pulled fresh
+    # from each report because the same company may have different
+    # requesters for different reports.
+    try:
+        db.execute("ALTER TABLE applicants ADD COLUMN requester_email TEXT")
+    except psycopg2.Error:
+        pass  # Column already exists
+
     # Migration: add bot-detection columns to email_tracking for existing databases
     for col_sql in [
         "ALTER TABLE email_tracking ADD COLUMN first_human_open_at TIMESTAMP",
@@ -695,6 +705,8 @@ def parse_accio_xml(xml_string):
                 oi_email = _xt(ai, "primaryuser_contact_email")
                 if not oi_phone:
                     oi_phone = _xt(ai, "primaryuser_contact_telephone")
+        # Collect ALL requester emails from this report (may be more than one)
+        requester_emails = _extract_requester_emails(oi, ci, ai)
         sub_order_el = po.find("subOrder")
         sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
         order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
@@ -711,7 +723,8 @@ def parse_accio_xml(xml_string):
                                        accio_remote_number="", company_name=company_name,
                                        account_name=account_name,
                                        accio_sub_order=sub_order_id, accio_order_type=order_type,
-                                       date_of_birth=dob, last_four_ssn=ssn4))
+                                       date_of_birth=dob, last_four_ssn=ssn4,
+                                       requester_email=requester_emails))
 
     # --- Format 2: Action Letter XML Post (postLetter with orderInfo) ---
     for post_letter in root.iter("postLetter"):
@@ -732,13 +745,15 @@ def parse_accio_xml(xml_string):
                 email = _xt(order_info, "requester_email")
             if not phone:
                 phone = _xt(order_info, "requester_phone")
+            requester_emails = _extract_requester_emails(order_info)
             if first or last:
                 applicants.append(dict(first_name=first, last_name=last, email=email,
                                        phone=phone, accio_order_number=order_number,
                                        accio_remote_number=remote_order, company_name="",
                                        account_name="",
                                        accio_sub_order=sub_order_id, accio_order_type=order_type,
-                                       date_of_birth=dob, last_four_ssn=ssn4))
+                                       date_of_birth=dob, last_four_ssn=ssn4,
+                                       requester_email=requester_emails))
 
     # --- Format 3: Vendor dispatch XML (orderRequest with subject) ---
     for order_req in root.iter("orderRequest"):
@@ -747,6 +762,10 @@ def parse_accio_xml(xml_string):
         sub_order_el = order_req.find("subOrder")
         sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
         order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
+        req_oi = order_req.find("orderInfo")
+        req_ci = order_req.find("clientInfo")
+        req_ai = order_req.find("accountInfo")
+        requester_emails = _extract_requester_emails(req_oi, req_ci, req_ai, order_req)
         for subject in order_req.iter("subject"):
             first = _xt(subject, "name_first") or _xt(subject, "firstName")
             last = _xt(subject, "name_last") or _xt(subject, "lastName")
@@ -760,7 +779,8 @@ def parse_accio_xml(xml_string):
                                        accio_remote_number=remote_number, company_name="",
                                        account_name="",
                                        accio_sub_order=sub_order_id, accio_order_type=order_type,
-                                       date_of_birth=dob, last_four_ssn=ssn4))
+                                       date_of_birth=dob, last_four_ssn=ssn4,
+                                       requester_email=requester_emails))
 
     # --- Format 4: Generic fallback - PersonalData or BackgroundSearchPackage ---
     if not applicants:
@@ -813,6 +833,7 @@ def parse_accio_xml(xml_string):
                     order_email = _xt(ai, "primaryuser_contact_email")
                     if not order_phone:
                         order_phone = _xt(ai, "primaryuser_contact_telephone")
+            requester_emails = _extract_requester_emails(order_info, ci, ai)
             sub_order_el = place_order.find("subOrder")
             sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
             order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
@@ -841,7 +862,8 @@ def parse_accio_xml(xml_string):
                                            accio_remote_number="", company_name=company_name,
                                            account_name=account_name,
                                            accio_sub_order=sub_order_id, accio_order_type=order_type,
-                                           date_of_birth=dob, last_four_ssn=ssn4))
+                                           date_of_birth=dob, last_four_ssn=ssn4,
+                                           requester_email=requester_emails))
 
     # --- Format 5b: <order> tag (older AccioOrder variants) ---
     if not applicants:
@@ -849,10 +871,13 @@ def parse_accio_xml(xml_string):
             order_number = order.get("number", "")
             remote_number = order.get("remote_order", "")
             order_info = order.find("orderInfo")
+            order_ci = order.find("clientInfo")
+            order_ai = order.find("accountInfo")
             order_email = order_phone = ""
             if order_info is not None:
                 order_email = _xt(order_info, "requester_email")
                 order_phone = _xt(order_info, "requester_phone")
+            requester_emails = _extract_requester_emails(order_info, order_ci, order_ai)
             sub_order_el = order.find("subOrder")
             sub_order_id = (sub_order_el.get("id", "") or sub_order_el.get("number", "1")) if sub_order_el is not None else "1"
             order_type = (sub_order_el.get("type", "") or "Fingerprint") if sub_order_el is not None else "Fingerprint"
@@ -877,7 +902,8 @@ def parse_accio_xml(xml_string):
                                            accio_remote_number=remote_number, company_name="",
                                            account_name="",
                                            accio_sub_order=sub_order_id, accio_order_type=order_type,
-                                           date_of_birth=dob, last_four_ssn=ssn4))
+                                           date_of_birth=dob, last_four_ssn=ssn4,
+                                           requester_email=requester_emails))
 
     # --- Deep scan fallback ---
     if not applicants:
@@ -920,6 +946,48 @@ def parse_accio_xml(xml_string):
 def _xt(el, tag):
     c = el.find(tag)
     return c.text.strip() if c is not None and c.text else ""
+
+
+def _extract_requester_emails(*elements):
+    """
+    Collect ALL requester-style email addresses found in the given XML
+    elements (orderInfo, clientInfo, accountInfo) and return them as a
+    de-duplicated comma-separated string.
+
+    Handles these cases:
+      * multiple <requester_email> tags within one element
+      * a single tag that itself contains multiple comma/semicolon-
+        separated addresses
+      * fallback to primaryuser_contact_email when requester_email is
+        absent (older Accio formats)
+    """
+    import re as _re
+    tag_names = (
+        "requester_email", "requesterEmail", "requestor_email",
+        "requesterEmailAddress", "primaryuser_contact_email",
+    )
+    collected = []
+    seen = set()
+    for el in elements:
+        if el is None:
+            continue
+        for tag in tag_names:
+            for child in el.iter(tag):
+                raw = (child.text or "").strip()
+                if not raw:
+                    continue
+                # Split on comma, semicolon, or whitespace just in case a
+                # single tag contains several addresses
+                for piece in _re.split(r"[,;\s]+", raw):
+                    piece = piece.strip().strip("<>")
+                    if not piece or "@" not in piece:
+                        continue
+                    key = piece.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    collected.append(piece)
+    return ", ".join(collected)
 
 
 def _extract_dob(subject_el):
@@ -998,12 +1066,38 @@ def send_release_email(db, applicant_id):
     if not smtp_server or not sender_email:
         return False, "SMTP not configured. Go to Settings."
 
-    # Look up client email so we can CC them on the applicant notification
-    client_email = None
-    if a.get("client_id"):
+    # Collect the CC list for this applicant.
+    # Priority 1: the requester email(s) captured from the Accio report itself
+    #             (stored per-applicant because the same company can have
+    #             different requesters on different reports).
+    # Priority 2 (fallback only): the client's contact_email on file, if set.
+    # Result is a de-duplicated list, excluding the applicant's own address.
+    import re as _re_cc
+    cc_list = []
+    _seen_cc = set()
+    applicant_addr = (a.get("email") or "").strip().lower()
+
+    def _add_cc(raw):
+        if not raw:
+            return
+        for piece in _re_cc.split(r"[,;\s]+", raw):
+            piece = piece.strip().strip("<>")
+            if not piece or "@" not in piece:
+                continue
+            key = piece.lower()
+            if key == applicant_addr or key in _seen_cc:
+                continue
+            _seen_cc.add(key)
+            cc_list.append(piece)
+
+    # Per-report requester emails — primary source
+    _add_cc(a.get("requester_email"))
+
+    # Fallback to the client's manually-entered contact_email
+    if not cc_list and a.get("client_id"):
         client_row = db.execute("SELECT contact_email FROM clients WHERE id = %s", (a["client_id"],)).fetchone()
         if client_row and client_row["contact_email"]:
-            client_email = client_row["contact_email"].strip()
+            _add_cc(client_row["contact_email"])
 
     reps = dict(first_name=a["first_name"], last_name=a["last_name"],
                 email=a["email"], code=a["assigned_code"],
@@ -1016,8 +1110,8 @@ def send_release_email(db, applicant_id):
     msg = MIMEMultipart("mixed")
     msg["From"] = f"{sender_name} <{sender_email}>"
     msg["To"] = a["email"]
-    if client_email:
-        msg["Cc"] = client_email
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
     msg["Subject"] = subj
     msg["Reply-To"] = sender_email
     # RFC 5322 required headers — missing these is a major spam signal
@@ -1064,7 +1158,7 @@ This message was sent by {h(company_name)}. If you believe you received this ema
 
     try:
         logger.info(f"SMTP: Connecting to {smtp_server}:{smtp_port} (TLS={use_tls})")
-        cc_info = f", Cc={client_email}" if client_email else ""
+        cc_info = f", Cc={'; '.join(cc_list)}" if cc_list else ""
         logger.info(f"SMTP: From={sender_email}, To={a['email']}{cc_info}, User={smtp_user}")
         srv = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
         srv.set_debuglevel(0)  # Disabled — debuglevel=1 leaks SMTP credentials to logs
@@ -3396,21 +3490,22 @@ def page_clients(db, params, nav_user=None):
             <p><strong>Total Applicants:</strong> {len(applicants)}</p>
         </div>
         <div class="card"><div class="card-title">Applicants</div>
-            <table><thead><tr><th>Order #</th><th>Name</th><th>Email</th><th>Received</th><th>Email Sent</th><th>Status</th><th>Code</th><th>Actions</th></tr></thead><tbody>
+            <table><thead><tr><th>Order #</th><th>Name</th><th>Applicant Email</th><th>Requester Email(s) <small style="font-weight:normal; color:var(--gray-500);">(CC'd)</small></th><th>Received</th><th>Email Sent</th><th>Status</th><th>Code</th><th>Actions</th></tr></thead><tbody>
         """
         for a in applicants:
             safe_st = h(a['status']).replace(" ", "_")
             received_dt = fmt_dt(a.get('created_at'))
             sent_dt = fmt_dt(a.get('email_sent_at')) if a.get('email_sent_at') else '-'
+            requester_cell = h(a.get('requester_email') or '') or '<span style="color:var(--gray-400);">-</span>'
             resend_btn = ""
             if a.get('email') and a.get('assigned_code'):
                 resend_btn = (
                     f'<form method="POST" action="/applicants/{a["id"]}/resend" style="display:inline;">'
                     f'<input type="hidden" name="redirect" value="/clients?client_id={client_id}">'
-                    f'<button type="submit" class="btn btn-small" style="background:#17a2b8; color:white;" title="Resend email with CC to client">'
+                    f'<button type="submit" class="btn btn-small" style="background:#17a2b8; color:white;" title="Resend email with CC to requester(s)">'
                     f'<i class="fas fa-redo"></i> Resend</button></form>'
                 )
-            content += f"<tr><td><code style='font-size:0.8rem;'>{h(a['accio_order_number'] or '-')}</code></td><td>{h(a['first_name'])} {h(a['last_name'])}</td><td>{h(a['email'] or '-')}</td><td>{received_dt}</td><td>{sent_dt}</td><td><span class=\"status-badge status-{safe_st}\">{h(a['status'])}</span></td><td><code>{h(a['assigned_code'] or '-')}</code></td><td>{resend_btn}</td></tr>"
+            content += f"<tr><td><code style='font-size:0.8rem;'>{h(a['accio_order_number'] or '-')}</code></td><td>{h(a['first_name'])} {h(a['last_name'])}</td><td>{h(a['email'] or '-')}</td><td style='font-size:0.85rem;'>{requester_cell}</td><td>{received_dt}</td><td>{sent_dt}</td><td><span class=\"status-badge status-{safe_st}\">{h(a['status'])}</span></td><td><code>{h(a['assigned_code'] or '-')}</code></td><td>{resend_btn}</td></tr>"
         content += "</tbody></table></div>"
     else:
         clients = db.execute("""
@@ -4162,12 +4257,13 @@ class Handler(BaseHTTPRequestHandler):
                                         client_id = client["id"]
 
                                 cur = db.execute(
-                                    "INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number,client_id,accio_sub_order,accio_order_type,date_of_birth,last_four_ssn) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                                    "INSERT INTO applicants (first_name,last_name,email,phone,accio_order_number,accio_remote_number,client_id,accio_sub_order,accio_order_type,date_of_birth,last_four_ssn,requester_email) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                                     (a["first_name"], a["last_name"], a.get("email", ""),
                                      a.get("phone", ""), a.get("accio_order_number", ""),
                                      a.get("accio_remote_number", ""), client_id,
                                      a.get("accio_sub_order", "1"), a.get("accio_order_type", "Fingerprint"),
-                                     a.get("date_of_birth", ""), a.get("last_four_ssn", ""))
+                                     a.get("date_of_birth", ""), a.get("last_four_ssn", ""),
+                                     a.get("requester_email", ""))
                                 )
                                 new_id = cur.fetchone()["id"]
                                 added += 1
