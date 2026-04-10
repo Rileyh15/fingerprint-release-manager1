@@ -1576,29 +1576,50 @@ def h(text):
     return (str(text) if text is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
 
 
-def fmt_dt(val):
-    """Format datetime for display in America/Chicago (Central) time.
+_CENTRAL_TZ = ZoneInfo("America/Chicago")
 
-    Render servers run in UTC, so all timestamps in the database are UTC.
-    We convert them to Central Time (CST/CDT auto-handled) so the UI shows
-    the correct local time for Louisiana operations.
+
+def to_central(val):
+    """Convert a naive UTC datetime (or ISO string) to America/Chicago.
+
+    Render servers run in UTC, so all timestamps written with
+    datetime.now() or PostgreSQL NOW() are UTC.  This helper attaches
+    UTC, then converts to Central so downstream strftime calls produce
+    the correct local time for Louisiana operations.  Handles DST
+    automatically via ZoneInfo.  Returns the converted datetime, or
+    None if the input is empty/invalid.
     """
     if not val:
-        return "-"
+        return None
     if isinstance(val, str):
         try:
             val = datetime.fromisoformat(val)
         except Exception:
-            return val
-    # Timestamps from the DB are naive (no tzinfo) but represent UTC.
-    # Attach UTC, then convert to Central.
+            return None
     try:
         if val.tzinfo is None:
             val = val.replace(tzinfo=ZoneInfo("UTC"))
-        val = val.astimezone(ZoneInfo("America/Chicago"))
+        return val.astimezone(_CENTRAL_TZ)
     except Exception:
-        pass
-    return val.strftime("%Y-%m-%d %I:%M %p")
+        return val
+
+
+def fmt_dt(val):
+    """Format datetime for display in Central Time (CST/CDT)."""
+    if not val:
+        return "-"
+    converted = to_central(val)
+    if converted is None:
+        return str(val) if val else "-"
+    return converted.strftime("%Y-%m-%d %I:%M %p")
+
+
+def fmt_dt_short(val, include_date=True):
+    """Short Central-time format used in the LAPS dashboard and similar."""
+    converted = to_central(val)
+    if converted is None:
+        return "?"
+    return converted.strftime("%m/%d %I:%M %p" if include_date else "%I:%M %p")
 
 
 # ===========================================================================
@@ -2657,7 +2678,7 @@ def page_laps_dashboard(db, nav_user=None):
     # Worker status
     worker_status = "Running" if _laps_worker_running else "Stopped"
     worker_color = "#16a34a" if _laps_worker_running else "#dc2626"
-    next_run_str = _laps_next_run.strftime("%I:%M %p %Z") if _laps_next_run else "N/A"
+    next_run_str = to_central(_laps_next_run).strftime("%I:%M %p %Z") if _laps_next_run else "N/A"
 
     last_summary_html = ""
     if _laps_last_summary:
@@ -2677,8 +2698,8 @@ def page_laps_dashboard(db, nav_user=None):
     # Cycle history table
     cycle_rows = ""
     for c in cycles:
-        started = c["started_at"].strftime("%m/%d %I:%M %p") if c.get("started_at") else "?"
-        finished = c["finished_at"].strftime("%I:%M %p") if c.get("finished_at") else "running..."
+        started = fmt_dt_short(c.get("started_at")) if c.get("started_at") else "?"
+        finished = fmt_dt_short(c.get("finished_at"), include_date=False) if c.get("finished_at") else "running..."
         status_badge = f'<span style="color:{"#16a34a" if c.get("status","") == "completed" else "#f59e0b"}">{h(c.get("status", "?"))}</span>'
         cycle_rows += f"""
         <tr>
@@ -2698,7 +2719,7 @@ def page_laps_dashboard(db, nav_user=None):
         name_display = f"{h(r.get('first_name',''))} {h(r.get('last_name',''))}" if r.get('first_name') else h(r.get('laps_name', 'N/A'))
         status_color = "#16a34a" if r.get("laps_status") == "Clear" else "#dc2626" if r.get("laps_status") == "Hits" else "#f59e0b"
         push_icon = '<i class="fas fa-check-circle" style="color:#16a34a"></i>' if r.get("accio_push_ok") else '<i class="fas fa-times-circle" style="color:#dc2626"></i>'
-        created = r["created_at"].strftime("%m/%d %I:%M %p") if r.get("created_at") else "?"
+        created = fmt_dt_short(r.get("created_at")) if r.get("created_at") else "?"
         result_rows += f"""
         <tr>
             <td>{name_display}</td>
@@ -2723,7 +2744,7 @@ def page_laps_dashboard(db, nav_user=None):
 
     awaiting_rows = ""
     for a in awaiting:
-        sent_at = a["email_sent_at"].strftime("%m/%d %I:%M %p") if a.get("email_sent_at") else "N/A"
+        sent_at = fmt_dt_short(a.get("email_sent_at")) if a.get("email_sent_at") else "N/A"
         awaiting_rows += f"""
         <tr>
             <td>{a['id']}</td>
@@ -3173,7 +3194,9 @@ def page_applicants(db, params, nav_user=None):
             if sent_at:
                 try:
                     dt = datetime.fromisoformat(str(sent_at)) if not isinstance(sent_at, datetime) else sent_at
-                    sent_label = f' <span style="color:#999;font-size:0.75rem;">({dt.strftime("%m/%d %I:%M%p").lower()})</span>'
+                    dt_central = to_central(dt)
+                    if dt_central is not None:
+                        sent_label = f' <span style="color:#999;font-size:0.75rem;">({dt_central.strftime("%m/%d %I:%M%p").lower()})</span>'
                 except Exception:
                     pass
             email_status = f'<span class="email-status email-status-opened"></span> Sent{sent_label}'
